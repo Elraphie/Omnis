@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config/load.js'
 import { activeCorridors, TOKENS, token, venuesForPair, type VenueId } from '../config/tokens.js'
 import { gasCostUsdMicros, ladderSizes, microsToNumber } from '../pricing/math.js'
+import { referenceGaps, type ReferenceGap, type ReferenceRates } from '../reference/fx.js'
 import { killReason, reviewOpenRisk, reviewReduceRisk, shouldTripLossStop } from '../risk/guards.js'
 import { findArbs, type ArbOpportunity, type PricedQuote } from '../strategies/arbitrage.js'
 import { bestBid, buildMmQuotes, fxRebalance, inventoryMarks, nairaBasis, priceOf, type BasisRow, type MmQuote } from '../strategies/book.js'
@@ -30,6 +31,9 @@ export interface CycleReport {
   decision: StrategyChoice
   mmQuotes: MmQuote[]
   basis: BasisRow[]
+  /** On-chain prices against the fiat reference at the smallest clip. Empty without a reference. */
+  referenceGaps: ReferenceGap[]
+  referenceAsOf: string | null
   venueErrors: { venue: string; message: string }[]
   quoteCount: number
   paper: {
@@ -49,6 +53,8 @@ export interface CycleDeps {
   celoUsdMicros: bigint
   quoteSource: 'live' | 'fixture'
   now?: Date
+  /** Fiat rates per USD to measure on-chain prices against. Measurement only; no decision reads it. */
+  reference?: ReferenceRates | null
   /** Called only when mode is live and a broadcastable route exists. */
   broadcaster?: (opp: ArbOpportunity) => Promise<void>
 }
@@ -141,6 +147,22 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     adverseBps: cfg.adverseBps,
   })
   const chosen = bestArb(opps, cfg.minEdgeUsdMicros, cfg.minEdgeBps)
+  store.insertOpportunities(ts, deps.quoteSource, opps.map((opp) => ({
+    corridor: opp.corridor,
+    buyVenue: opp.buyVenue,
+    sellVenue: opp.sellVenue,
+    sizeUsd: microsToNumber(opp.sizeUsdMicros),
+    grossUsd: microsToNumber(opp.grossUsdMicros),
+    gasUsd: microsToNumber(opp.gasUsdMicros),
+    bufferUsd: microsToNumber(opp.adverseUsdMicros),
+    netUsd: microsToNumber(opp.netUsdMicros),
+    netBps: Number(opp.netBps),
+  })))
+  const smallest = sizes.reduce<bigint | null>((min, size) => (min === null || size < min ? size : min), null)
+  const gaps = deps.reference && smallest !== null
+    ? referenceGaps({ corridors, quotes, reference: deps.reference, sizeUsdMicros: smallest })
+    : []
+  if (deps.reference) store.insertReferenceGaps(ts, deps.quoteSource, deps.reference, gaps)
   const balances = store.balances()
   const marks = inventoryMarks(balances, quotes)
   const inventoryUsd = (symbol: string) => marks.usd[symbol] ?? 0n
@@ -324,6 +346,8 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     decision,
     mmQuotes,
     basis,
+    referenceGaps: gaps,
+    referenceAsOf: deps.reference?.asOf ?? null,
     venueErrors: errors,
     quoteCount: quotes.length,
     paper: {

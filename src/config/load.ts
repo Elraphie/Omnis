@@ -14,6 +14,9 @@ const envSchema = z.object({
   CONFIRM_LIVE: z.string().optional(),
   CELO_RPC: z.string().url().default('https://forno.celo.org'),
   PORT: z.coerce.number().int().positive().max(65535).default(43123),
+  HOST: z.string().min(1).default('0.0.0.0'),
+  FX_REFERENCE_URL: z.union([z.literal('off'), z.string().url()]).default('https://open.er-api.com/v6/latest/USD'),
+  FX_REFERENCE_TTL_SEC: z.coerce.number().int().positive().default(3600),
   DATA_DIR: z.string().min(1).default('./data'),
   MIN_EDGE_USD: z.coerce.number().nonnegative().default(0.05),
   MIN_EDGE_BPS: z.coerce.number().nonnegative().max(10_000).default(3),
@@ -69,6 +72,10 @@ export interface AppConfig {
   chainId: 42220
   rpcUrl: string
   port: number
+  host: string
+  /** Fiat reference for measurement. Empty when FX_REFERENCE_URL=off. */
+  fxReferenceUrl: string
+  fxReferenceTtlSec: number
   dataDir: string
   minEdgeUsdMicros: bigint
   minEdgeBps: bigint
@@ -248,6 +255,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     chainId: 42220,
     rpcUrl: raw.CELO_RPC,
     port: raw.PORT,
+    host: raw.HOST,
+    fxReferenceUrl: raw.FX_REFERENCE_URL === 'off' ? '' : raw.FX_REFERENCE_URL,
+    fxReferenceTtlSec: raw.FX_REFERENCE_TTL_SEC,
     dataDir: raw.DATA_DIR,
     minEdgeUsdMicros: usdToMicros(raw.MIN_EDGE_USD),
     minEdgeBps: BigInt(Math.round(raw.MIN_EDGE_BPS)),
@@ -310,6 +320,7 @@ export function publicConfig(cfg: AppConfig) {
     convertFeeBps: Number(cfg.convertFeeBps),
     treasury: cfg.treasury,
     quoteSource: cfg.quoteSource,
+    fxReference: cfg.fxReferenceUrl ? new URL(cfg.fxReferenceUrl).host : null,
     signer: cfg.signerKind,
     attributionTag: cfg.attributionTag || null,
     includeExtended: cfg.includeExtended,

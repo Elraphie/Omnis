@@ -6,7 +6,7 @@ import { createReader, createSigner } from '../chain/client.js'
 import { loadConfig } from '../config/load.js'
 import type { CycleReport } from '../execution/engine.js'
 import { createLogger } from '../log/logger.js'
-import { createConvertApi, runDeskCycle } from '../runtime.js'
+import { createConvertApi, referenceFeedFor, runDeskCycle } from '../runtime.js'
 import { Store } from '../store/db.js'
 
 const log = createLogger('omnis')
@@ -21,6 +21,7 @@ if (loaded.cfg.mode === 'live' && !signer.canSign) {
   throw new Error('MODE=live requires a signer that can sign. Attach a KMS adapter or provide AGENT_PRIVATE_KEY with CONFIRM_LIVE=I_UNDERSTAND.')
 }
 const convert = createConvertApi({ cfg: loaded.cfg, client: loaded.cfg.quoteSource === 'fixture' ? null : client })
+const reference = referenceFeedFor(loaded.cfg, (message) => log.warn('reference rates unavailable', { message }))
 let report: CycleReport | null = null
 let running = false
 
@@ -33,6 +34,7 @@ async function cycle() {
       store,
       client: loaded.cfg.quoteSource === 'fixture' ? null : client,
       signer,
+      reference,
     })
     log.info('scan', {
       quoteSource: report.quoteSource,
@@ -40,6 +42,7 @@ async function cycle() {
       reason: report.decision.reason,
       bestEdgeBps: report.best?.netEdgeBps ?? null,
       quotes: report.quoteCount,
+      referenceGaps: report.referenceGaps.length,
       errors: report.venueErrors.length,
     })
   } catch (error) {
@@ -58,8 +61,8 @@ const server = startServer({
   buildConvert: (body) => convert.build(body),
 })
 
-server.listen(loaded.cfg.port, '0.0.0.0', () => {
-  log.info('listening', { port: loaded.cfg.port, mode: loaded.cfg.mode, signer: signer.kind })
+server.listen(loaded.cfg.port, loaded.cfg.host, () => {
+  log.info('listening', { host: loaded.cfg.host, port: loaded.cfg.port, mode: loaded.cfg.mode, signer: signer.kind })
 })
 
 if (loaded.cfg.startupDelaySec > 0) {

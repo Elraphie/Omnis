@@ -4,7 +4,7 @@ import { createSigner, createReader } from '../chain/client.js'
 import { loadConfig } from '../config/load.js'
 import { createLogger } from '../log/logger.js'
 import { formatUsd } from '../pricing/math.js'
-import { runDeskCycle } from '../runtime.js'
+import { referenceFeedFor, runDeskCycle } from '../runtime.js'
 import { Store } from '../store/db.js'
 
 const log = createLogger('omnis')
@@ -24,6 +24,7 @@ const report = await runDeskCycle({
   store,
   client: loaded.cfg.quoteSource === 'fixture' ? null : client,
   signer,
+  reference: referenceFeedFor(loaded.cfg, (message) => log.warn('reference rates unavailable', { message })),
 })
 store.close()
 const best = report.best

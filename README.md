@@ -95,6 +95,18 @@ The fee is `CONVERT_FEE_BPS` of the input, sent to `TREASURY_ADDRESS` as an ERC-
 
 Approvals are the exact swap amount. A non-zero USDT allowance is reset to zero first. `maxUint256` is refused.
 
+### Measuring the edge
+
+Every scan stores each round trip it priced (table `opportunities`) and, when `FX_REFERENCE_URL` is set, each venue's price against a fiat reference at the smallest clip (table `reference_gaps`). Let the desk run on live quotes, then summarise:
+
+```bash
+npm run report
+npm run report -- --hours 24 --top 20
+npm run report -- --json
+```
+
+The report shows venue health, how often any round trip clears gas and the cushion, an upper bound on what one fill per scan would have made, per-route frequency and size of edges with how long they stayed open, and the on-chain premium or discount against the reference per corridor, venue, and side. Fixture scans are excluded unless you pass `--include-fixture`. The default reference is a once-a-day rate, so it measures lasting premiums, not intraday lag.
+
 ### Paper and dry-run
 
 Dry-run records the decision and does not move a balance. Paper starts from `PAPER_USDT` (default 1000), applies a round trip at the quoted output minus gas, and stores equity in SQLite under `DATA_DIR`. Both modes use read-only RPC calls. Tests use an in-memory database and a fixture book, so `npm test` does not need a network or a key.
@@ -118,6 +130,9 @@ Even then, the desk will not broadcast a Textile preview. A preview is not a fil
 | `MODE` | `dry-run` | `dry-run`, `paper`, or `live` |
 | `CELO_RPC` | `https://forno.celo.org` | Celo RPC |
 | `PORT` | `43123` | HTTP port |
+| `HOST` | `0.0.0.0` | Bind address. `127.0.0.1` for a local-only desk |
+| `FX_REFERENCE_URL` | `https://open.er-api.com/v6/latest/USD` | Fiat reference for measurement. `off` disables |
+| `FX_REFERENCE_TTL_SEC` | `3600` | How long reference rates are cached |
 | `DATA_DIR` | `./data` | SQLite directory |
 | `MIN_EDGE_USD` | `0.05` | Minimum net dollars |
 | `MIN_EDGE_BPS` | `3` | Minimum net basis points |

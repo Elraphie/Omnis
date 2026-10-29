@@ -15,6 +15,7 @@ import {
 } from './convert/service.js'
 import { runCycle, type CycleDeps, type CycleReport } from './execution/engine.js'
 import { executeLive } from './execution/live.js'
+import { createReferenceFeed, type ReferenceFeed } from './reference/fx.js'
 import type { TradingSigner } from './chain/signer.js'
 import type { Store } from './store/db.js'
 import { fallbackAdapters, createLiveAdapters } from './venues/registry.js'
@@ -38,6 +39,7 @@ export async function runDeskCycle(args: {
   client: ChainClient | null
   signer: TradingSigner
   now?: Date
+  reference?: ReferenceFeed | null
 }): Promise<CycleReport> {
   const gas = await gasPrice(args.client, args.cfg.gasPriceWeiFallback)
   const base: Omit<CycleDeps, 'adapters' | 'quoteSource'> = {
@@ -46,6 +48,7 @@ export async function runDeskCycle(args: {
     gasPriceWei: gas,
     celoUsdMicros: args.cfg.celoUsdMicros,
     now: args.now,
+    reference: args.reference ? await args.reference.get() : null,
     broadcaster: async (opp) => {
       await executeLive({
         mode: args.cfg.mode,
@@ -67,6 +70,12 @@ export async function runDeskCycle(args: {
     return runCycle({ ...base, adapters: fallbackAdapters(), quoteSource: 'fixture' })
   }
   return live
+}
+
+/** Null when FX_REFERENCE_URL is empty. Refresh failures are logged through `onError` and never stop a scan. */
+export function referenceFeedFor(cfg: AppConfig, onError?: (message: string) => void): ReferenceFeed | null {
+  if (!cfg.fxReferenceUrl) return null
+  return createReferenceFeed({ url: cfg.fxReferenceUrl, ttlMs: cfg.fxReferenceTtlSec * 1000, timeoutMs: cfg.quoteTimeoutMs, onError })
 }
 
 async function quotesFor(
