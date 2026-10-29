@@ -2,8 +2,6 @@
 
 Omnis is a Celo FX desk. It quotes the same currency on Uniswap v3, Textile FX, and Mento, decides whether the gap still pays after gas and a cushion for quotes that are not firm, and can hand a user an unsigned conversion at the best route it found. It does not hold user funds. It boots in **dry-run** and will not sign anything unless you deliberately turn live mode on.
 
-This is a rewrite of [Kiyoshi](https://github.com/MELcodes99/kiyoshi) by Mel Okoye. Kiyoshi scanned wBRL, wARS, and cNGN against USDT every minute, crossed Uniswap and Textile when the gap cleared a few cents, and exposed a non-custodial Convert API. That trade worked. By 25–28 October 2026 the bot's own book was about **$228 of profit on roughly $63k of volume**, the margin was down around **2 bps**, and later scans were negative. A 2 bp gross gap does not survive gas, a Textile fee, and any slippage cushion. Omnis keeps the corridors and the Convert shape, and it stops treating a raw hot key and an unlimited approval as the default.
-
 See [NOTICE.md](NOTICE.md) for the attribution and the license gap upstream.
 
 ## What it does
