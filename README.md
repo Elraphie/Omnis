@@ -69,7 +69,7 @@ npm run dev           # desk plus HTTP on port 43123
 npm run build && npm start
 ```
 
-`npm run once` and `npm run dev` default to dry-run. Set `MODE=paper` to simulate fills and write P&L. If `QUOTE_SOURCE=auto` and every venue fails, the cycle falls back to a fixture book and says so. Fixture numbers are not live prices.
+`npm run once` and `npm run dev` default to dry-run. Set `MODE=paper` to simulate fills and write P&L. In dry-run, if `QUOTE_SOURCE=auto` and every venue fails, the cycle falls back to a fixture book and says so. Paper and live never fall back: they hold on an empty book, so paper P&L is only ever booked from live quotes (or from `QUOTE_SOURCE=fixture`, which you chose on purpose). Fixture numbers are not live prices. To see the desk page locally, set `PUBLIC_STATUS=1` or enter a key from `ADMIN_KEYS`.
 
 Copy `.env.example` to `.env` when you want a fee, an API key, or a different RPC. A private key is not required. If one is present and the mode is not live, it is ignored and a warning is logged.
 
@@ -79,15 +79,17 @@ Copy `.env.example` to `.env` when you want a fee, an API key, or a different RP
 |---|---|---|---|
 | GET | `/` | no | Desk page |
 | GET | `/health` | no | Liveness |
-| GET | `/status` | no | Last scan, decision, config, recent paper trades |
-| GET | `/trades` | no | Recent fills |
-| GET | `/pnl` | no | Realized P&L and balances |
-| GET | `/metrics` | no | Prometheus text |
+| GET | `/status` | admin key | Last scan, decision, config, recent paper trades |
+| GET | `/trades` | admin key | Recent fills |
+| GET | `/pnl` | admin key | Realized P&L and balances |
+| GET | `/metrics` | admin key | Prometheus text |
 | GET | `/convert/quote?from=USDT&to=wBRL&amount=100` | API key | Best route after the fee |
 | POST | `/convert/build` | API key | Unsigned steps for `wallet` |
-| POST | `/admin/kill` | API key | `{ "enabled": true }` manual kill switch |
+| POST | `/admin/kill` | admin key | `{ "enabled": true }` manual kill switch |
 
-Send the key as `Authorization: Bearer <key>` or `x-api-key`. Keys are stored only as SHA-256; logs keep a short id. Empty `API_KEYS` disables Convert. CORS echoes an allowed origin and never `*`. Requests with no `Origin` (server-side calls) are accepted. Same-host browser calls are accepted. Anything else needs `CORS_ORIGINS`. The default limit is 60 Convert or admin requests per key per minute.
+Send the key as `Authorization: Bearer <key>` or `x-api-key`. Keys are stored only as SHA-256; logs keep a short id. Empty `API_KEYS` disables Convert. Admin keys (`ADMIN_KEYS`) are separate from Convert keys, cannot reuse one, and are not rate limited, so a Convert customer can never reach the kill switch or the desk's P&L. `PUBLIC_STATUS=1` opens the status endpoints without a key for local development; do not set it in production.
+
+Every Convert response carries `quoteSource`. Convert never falls back from live prices to the fixture book: with no live route, `best` is null. `/convert/build` refuses fixture prices outright. CORS echoes an allowed origin and never `*`. Requests with no `Origin` (server-side calls) are accepted. Same-host browser calls are accepted. Anything else needs `CORS_ORIGINS`. The default limit is 60 Convert or admin requests per key per minute.
 
 The fee is `CONVERT_FEE_BPS` of the input, sent to `TREASURY_ADDRESS` as an ERC-20 transfer the user signs, then an exact approval and the swap for the remainder. It is not atomic: a wallet can drop the transfer and still swap. Say so to users. Set the fee to 0 until the treasury address is yours. The dead address in a demo config burns fees.
 
@@ -131,6 +133,8 @@ Even then, the desk will not broadcast a Textile preview. A preview is not a fil
 | `CONVERT_FEE_BPS` | `0` | Input fee, max 100 |
 | `TREASURY_ADDRESS` | | Required when the fee is non-zero |
 | `API_KEYS` | | Comma-separated Convert keys |
+| `ADMIN_KEYS` | | Comma-separated operator keys for `/admin` and status endpoints |
+| `PUBLIC_STATUS` | `0` | `1` serves status, trades, P&L, and metrics without a key (local only) |
 | `CORS_ORIGINS` | | Comma-separated origins, no wildcards |
 | `RATE_LIMIT_PER_MIN` | `60` | Per API key |
 | `ATTRIBUTION_TAG` | | Optional ERC-8021 code, `[a-z0-9_]{1,32}` |

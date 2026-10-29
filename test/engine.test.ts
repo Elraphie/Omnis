@@ -52,6 +52,9 @@ describe('paper and dry-run desk', () => {
     expect(report.trade!.pnlUsd).toBeGreaterThan(1)
     expect(report.paper.equityUsd).toBeGreaterThan(1001)
     expect(report.paper.realizedUsd).toBeCloseTo(report.trade!.pnlUsd, 4)
+    // Paper books the decision's net edge, adverse cushion included, not gross minus gas.
+    expect(report.best!.bufferUsd).toBeGreaterThan(0)
+    expect(report.trade!.pnlUsd).toBeCloseTo(report.best!.netEdgeUsd, 6)
     expect(store.recentTrades(5)).toHaveLength(1)
     expect(report.basis[0]?.tradable).toBe(false)
     expect(report.basis[0]?.gapBps).toBeGreaterThan(100)
@@ -84,6 +87,26 @@ describe('paper and dry-run desk', () => {
     expect(report.trade).toBeNull()
     expect(calls).toEqual([])
     expect(store.balances()).toEqual({})
+  })
+
+  it('never broadcasts on fixture quotes in live mode', async () => {
+    const store = new Store(':memory:')
+    const calls: string[] = []
+    const report = await runCycle({
+      cfg: loadConfig({
+        MODE: 'live', CONFIRM_LIVE: 'I_UNDERSTAND', AGENT_PRIVATE_KEY: `0x${'11'.repeat(32)}`,
+        MAX_TRADE_USD: '100', MIN_TRADE_USD: '10', SIZE_LADDER: '1', ADVERSE_BPS: '2',
+      }).cfg,
+      store,
+      adapters: fixtureAdapters('profitable'),
+      gasPriceWei: 5_000_000_000n,
+      celoUsdMicros: usdToMicros(0.3),
+      quoteSource: 'fixture',
+      broadcaster: async () => { calls.push('send') },
+    })
+    expect(calls).toEqual([])
+    expect(report.decision.action).toBe('hold')
+    expect(report.decision.reason).toBe('fixture quotes are not tradable')
   })
 
   it('obeys the kill switch, inventory cap, and daily loss stop', async () => {

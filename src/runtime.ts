@@ -61,7 +61,9 @@ export async function runDeskCycle(args: {
     return runCycle({ ...base, adapters: fallbackAdapters(), quoteSource: 'fixture' })
   }
   const live = await runCycle({ ...base, adapters: createLiveAdapters(args.client, args.cfg), quoteSource: 'live' })
-  if (args.cfg.quoteSource === 'auto' && live.quoteCount === 0) {
+  // The fixture fallback is a demo aid. In paper or live mode it would book or chase made-up prices,
+  // so those modes hold on an empty book instead.
+  if (args.cfg.quoteSource === 'auto' && live.quoteCount === 0 && args.cfg.mode === 'dry-run') {
     return runCycle({ ...base, adapters: fallbackAdapters(), quoteSource: 'fixture' })
   }
   return live
@@ -88,7 +90,9 @@ async function quotesFor(
 }
 
 export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | null }) {
-  const adapters = (): VenueAdapter[] => (args.cfg.quoteSource === 'fixture' || !args.client)
+  // Convert never falls back from live to fixture prices. With no live route it says so.
+  const quoteSource: ConvertQuote['quoteSource'] = (args.cfg.quoteSource === 'fixture' || !args.client) ? 'fixture' : 'live'
+  const adapters = (): VenueAdapter[] => (quoteSource === 'fixture' || !args.client)
     ? fallbackAdapters()
     : createLiveAdapters(args.client, args.cfg)
 
@@ -99,10 +103,7 @@ export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | n
     const { fee, swapAmount } = args.cfg.convertFeeBps > 0n
       ? (await import('./pricing/math.js')).splitInputFee(parsed.amount, args.cfg.convertFeeBps)
       : { fee: 0n, swapAmount: parsed.amount }
-    let quotes = await quotesFor(adapters(), parsed.token.symbol, other.symbol, swapAmount, args.cfg.quoteTimeoutMs)
-    if (quotes.length === 0 && args.cfg.quoteSource === 'auto') {
-      quotes = await quotesFor(fallbackAdapters(), parsed.token.symbol, other.symbol, swapAmount, args.cfg.quoteTimeoutMs)
-    }
+    const quotes = await quotesFor(adapters(), parsed.token.symbol, other.symbol, swapAmount, args.cfg.quoteTimeoutMs)
     return {
       fee,
       swapAmount,
@@ -115,6 +116,7 @@ export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | n
         treasury: args.cfg.treasury,
         quotes,
         slippageBps: args.cfg.convertSlippageBps,
+        quoteSource,
       }),
     }
   }
@@ -127,6 +129,7 @@ export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | n
       const input = body as { from?: string; to?: string; amount?: string; wallet?: string; venue?: string }
       if (!input.from || !input.to || !input.amount) throw new Error('from, to, and amount are required')
       const wallet = requireWallet(input.wallet)
+      if (quoteSource !== 'live') throw new Error('build needs live quotes. Fixture prices are for demos and are never signed.')
       const pricedQuote = await priced(input.from, input.to, input.amount)
       const chosen = input.venue
         ? pricedQuote.quotes.find((quote) => quote.venue === input.venue)

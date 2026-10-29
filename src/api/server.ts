@@ -34,6 +34,20 @@ function readBody(req: IncomingMessage): Promise<string> {
   })
 }
 
+/** Desk internals: P&L, balances, limits, treasury, key usage. Operators only unless PUBLIC_STATUS=1. */
+const OPS_PATHS = new Set(['/status', '/trades', '/pnl', '/metrics'])
+
+function presentedKey(req: IncomingMessage): string | undefined {
+  return (typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined)
+    ?? (typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : undefined)
+}
+
+/** Null when the caller holds an admin key, otherwise the reason it was refused. */
+function adminDenied(header: string | undefined, cfg: AppConfig): string | null {
+  if (cfg.adminKeys.length === 0) return 'admin endpoints are disabled until ADMIN_KEYS is set'
+  return authenticateApiKey(header, cfg.adminKeys).ok ? null : 'missing or invalid admin key'
+}
+
 function send(res: ServerResponse, code: number, body: unknown, headers: Record<string, string>, contentType = 'application/json; charset=utf-8'): void {
   res.writeHead(code, { 'content-type': contentType, 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', ...headers })
   res.end(typeof body === 'string' ? body : JSON.stringify(body, null, 2))
@@ -54,6 +68,7 @@ export function createHandler(deps: ServerDeps) {
       return
     }
     const url = new URL(req.url ?? '/', 'http://localhost')
+    const header = presentedKey(req)
     try {
       if (req.method === 'GET' && url.pathname === '/') {
         send(res, 200, statusPage(), cors, 'text/html; charset=utf-8')
@@ -70,6 +85,13 @@ export function createHandler(deps: ServerDeps) {
           quoteSource: report?.quoteSource ?? null,
         }, cors)
         return
+      }
+      if (OPS_PATHS.has(url.pathname) && !deps.cfg.publicStatus) {
+        const denied = adminDenied(header, deps.cfg)
+        if (denied) {
+          send(res, 401, { error: denied }, cors)
+          return
+        }
       }
       if (req.method === 'GET' && url.pathname === '/status') {
         const report = deps.getReport()
@@ -127,14 +149,27 @@ export function createHandler(deps: ServerDeps) {
         return
       }
 
-      const authed = url.pathname.startsWith('/convert') || url.pathname.startsWith('/admin')
-      if (authed) {
+      // Admin keys are separate from Convert keys and are not rate limited, so a busy
+      // dashboard can never lock an operator out of the kill switch.
+      if (url.pathname.startsWith('/admin')) {
+        const denied = adminDenied(header, deps.cfg)
+        if (denied) {
+          send(res, 401, { error: denied }, cors)
+          return
+        }
+        if (req.method === 'POST' && url.pathname === '/admin/kill') {
+          const body = JSON.parse((await readBody(req)) || '{}') as { enabled?: boolean }
+          deps.store.setManualKill(body.enabled !== false)
+          send(res, 200, { killSwitch: deps.store.manualKill() }, cors)
+          return
+        }
+      }
+
+      if (url.pathname.startsWith('/convert')) {
         if (deps.cfg.apiKeys.length === 0) {
           send(res, 401, { error: 'Convert is disabled until API_KEYS is set' }, cors)
           return
         }
-        const header = (typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined)
-          ?? (typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : undefined)
         const auth = authenticateApiKey(header, deps.cfg.apiKeys)
         if (!auth.ok) {
           send(res, 401, { error: 'missing or invalid API key' }, cors)
@@ -166,12 +201,6 @@ export function createHandler(deps: ServerDeps) {
             amount: body.amount,
           })
           send(res, 200, built, cors)
-          return
-        }
-        if (req.method === 'POST' && url.pathname === '/admin/kill') {
-          const body = JSON.parse((await readBody(req)) || '{}') as { enabled?: boolean }
-          deps.store.setManualKill(body.enabled !== false)
-          send(res, 200, { killSwitch: deps.store.manualKill() }, cors)
           return
         }
       }

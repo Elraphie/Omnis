@@ -18,6 +18,8 @@ export interface ConvertRoute {
 }
 
 export interface ConvertQuote {
+  /** `fixture` prices are demo numbers. They are never built into a transaction. */
+  quoteSource: 'live' | 'fixture'
   from: string
   to: string
   amountIn: string
@@ -60,6 +62,7 @@ export function assembleQuote(args: {
   treasury: Address | null
   quotes: VenueQuote[]
   slippageBps: bigint
+  quoteSource: ConvertQuote['quoteSource']
 }): ConvertQuote {
   const { fee, swapAmount } = args.feeBps > 0n ? splitInputFee(args.amountIn, args.feeBps) : { fee: 0n, swapAmount: args.amountIn }
   const candidates: RouteCandidate[] = args.quotes
@@ -73,6 +76,7 @@ export function assembleQuote(args: {
     : null
   const byVenue = new Map(args.quotes.map((quote) => [quote.venue, quote]))
   return {
+    quoteSource: args.quoteSource,
     from: args.from.symbol,
     to: args.to.symbol,
     amountIn: fmt(args.from, args.amountIn),
@@ -119,6 +123,8 @@ export function buildSteps(args: {
   textile?: { to: Address; data: Hex; buyAmount: bigint }
   deadline?: bigint
 }): UnsignedCall[] {
+  // A fixture price is not a market. A minimum-out derived from it either reverts or invites a sandwich.
+  if (args.quote.meta.source === 'fixture') throw new Error('refusing to build from a fixture quote')
   const calls: UnsignedCall[] = []
   if (args.fee > 0n) {
     if (!args.treasury) throw new Error('treasury is required when a fee is charged')

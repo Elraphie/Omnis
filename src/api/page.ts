@@ -41,6 +41,12 @@ export function statusPage(): string {
   </div>
   <div class="badges" id="badges">loading</div>
 </header>
+<main style="padding-bottom:0">
+  <form id="admin" style="grid-template-columns:3fr 1fr">
+    <label>Admin key (status, P&amp;L, metrics)<input name="admin" type="password" autocomplete="off" placeholder="from ADMIN_KEYS" /></label>
+    <button type="submit">Load desk</button>
+  </form>
+</main>
 <main>
   <section class="grid" id="stats"></section>
   <section>
@@ -75,8 +81,11 @@ function table(headers, rows) {
   return '<table><thead><tr>' + headers.map((h) => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>'
     + rows.map((row) => '<tr>' + row.map((cell) => '<td>' + cell + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
 }
+let adminKey = '';
+try { adminKey = sessionStorage.getItem('omnis.admin') || ''; } catch (e) {}
 async function refresh() {
-  const res = await fetch('/status');
+  const res = await fetch('/status', adminKey ? { headers: { authorization: 'Bearer ' + adminKey } } : {});
+  if (res.status === 401) { el('badges').textContent = 'locked'; el('routes').textContent = 'Enter an admin key above. For local development, PUBLIC_STATUS=1 opens this page without one.'; return; }
   if (!res.ok) { el('routes').textContent = 'Status unavailable (' + res.status + ').'; return; }
   const body = await res.json();
   const cycle = body.lastCycle;
@@ -101,6 +110,12 @@ async function refresh() {
   const basis = cycle && cycle.basis && cycle.basis[0];
   el('basis').innerHTML = basis ? '<p>' + basis.left + ' vs ' + basis.right + '. Gap <b>' + (basis.gapBps === null ? 'n/a' : basis.gapBps.toFixed(1) + ' bps') + '</b>. ' + basis.note + '</p>' : 'Not in this scan.';
 }
+document.getElementById('admin').addEventListener('submit', (event) => {
+  event.preventDefault();
+  adminKey = String(new FormData(event.target).get('admin') || '');
+  try { sessionStorage.setItem('omnis.admin', adminKey); } catch (e) {}
+  refresh();
+});
 document.getElementById('convert').addEventListener('submit', async (event) => {
   event.preventDefault();
   const data = new FormData(event.target);

@@ -222,13 +222,17 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     rebalance,
     rebalanceBlock: rebalanceBlock && !rebalanceBlock.ok ? rebalanceBlock.reason : null,
   })
+  if (cfg.mode === 'live' && deps.quoteSource === 'fixture' && decision.action !== 'hold') {
+    decision = { strategy: decision.strategy, action: 'hold', reason: 'fixture quotes are not tradable' }
+  }
   if (decision.action === 'arbitrage' && chosen && (balances.USDT ?? 0n) < chosen.sizeUsdMicros && cfg.mode !== 'dry-run') {
     decision = { strategy: 'arbitrage', action: 'hold', reason: 'insufficient paper USDT' }
   }
 
   let trade: CycleReport['trade'] = null
   if (decision.action === 'arbitrage' && chosen && cfg.mode === 'paper') {
-    const pnl = chosen.grossUsdMicros - chosen.gasUsdMicros
+    // Book the same net edge the decision used, cushion included, so paper P&L is not flattered.
+    const pnl = chosen.netUsdMicros
     store.setBalance('USDT', (balances.USDT ?? 0n) + pnl)
     store.addRealized(pnl)
     store.insertTrade({
