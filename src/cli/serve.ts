@@ -1,12 +1,13 @@
 import 'dotenv/config'
 import { join } from 'node:path'
+import { privateKeyToAccount } from 'viem/accounts'
 import { startServer } from '../api/server.js'
 import { RateLimiter } from '../api/rate-limit.js'
 import { createReader, createSigner } from '../chain/client.js'
 import { loadConfig } from '../config/load.js'
 import type { CycleReport } from '../execution/engine.js'
 import { createLogger } from '../log/logger.js'
-import { createConvertApi, referenceFeedFor, runDeskCycle } from '../runtime.js'
+import { createConvertApi, referenceFeedFor, runDeskCycle, shadowRunnerFor } from '../runtime.js'
 import { Store } from '../store/db.js'
 
 const log = createLogger('omnis')
@@ -22,6 +23,14 @@ if (loaded.cfg.mode === 'live' && !signer.canSign) {
 }
 const convert = createConvertApi({ cfg: loaded.cfg, client: loaded.cfg.quoteSource === 'fixture' ? null : client })
 const reference = referenceFeedFor(loaded.cfg, (message) => log.warn('reference rates unavailable', { message }))
+const shadow = shadowRunnerFor(loaded.cfg, loaded.secrets)
+if (shadow) {
+  log.info('shadow execution on', {
+    maxPerHour: loaded.cfg.shadowMaxPerHour,
+    textileLeg: loaded.secrets.shadowTakerKey ? 'firm quote' : 'preview only',
+    shadowWallet: loaded.secrets.shadowTakerKey ? privateKeyToAccount(loaded.secrets.shadowTakerKey).address : null,
+  })
+}
 let report: CycleReport | null = null
 let running = false
 
@@ -35,6 +44,7 @@ async function cycle() {
       client: loaded.cfg.quoteSource === 'fixture' ? null : client,
       signer,
       reference,
+      shadow,
     })
     log.info('scan', {
       quoteSource: report.quoteSource,
@@ -43,6 +53,9 @@ async function cycle() {
       bestEdgeBps: report.best?.netEdgeBps ?? null,
       quotes: report.quoteCount,
       referenceGaps: report.referenceGaps.length,
+      shadow: report.shadow
+        ? `${report.shadow.outcome} ${report.shadow.corridor} ${report.shadow.buyVenue}->${report.shadow.sellVenue} net ${report.shadow.netBps ?? 'n/a'} bps`
+        : null,
       errors: report.venueErrors.length,
     })
   } catch (error) {

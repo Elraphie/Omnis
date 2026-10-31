@@ -3,7 +3,9 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { parseArgs } from 'node:util'
-import { gapStats, medianIntervalSec, routeStats, scanSummary, venueHealth, type GapRow, type OppRow } from '../analysis/edges.js'
+import {
+  gapStats, medianIntervalSec, routeStats, scanSummary, shadowStats, venueHealth, type GapRow, type OppRow, type ShadowRow,
+} from '../analysis/edges.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -67,6 +69,30 @@ const gaps: GapRow[] = hasTable('reference_gaps')
       refAsOf: String(row.ref_as_of),
     }))
   : []
+const num = (value: SQLOutputValue | undefined) => (value === null || value === undefined ? null : Number(value))
+const str = (value: SQLOutputValue | undefined) => (value === null || value === undefined ? null : String(value))
+// Shadow runs only ever use live quotes, so they take the time filter alone.
+const shadowRows: ShadowRow[] = hasTable('shadow_trades')
+  ? (db.prepare(`SELECT corridor, buy_venue, sell_venue, size_usd, scan_net_bps, outcome, net_usd, net_bps, buy_status, sell_status,
+      buy_drift_bps, sell_drift_bps, textile_status, textile_detail, elapsed_ms FROM shadow_trades WHERE ts >= ?`).all(since) as Record<string, SQLOutputValue>[])
+      .map((row) => ({
+        corridor: String(row.corridor),
+        buyVenue: String(row.buy_venue),
+        sellVenue: String(row.sell_venue),
+        sizeUsd: Number(row.size_usd),
+        scanNetBps: Number(row.scan_net_bps),
+        outcome: String(row.outcome),
+        netUsd: num(row.net_usd),
+        netBps: num(row.net_bps),
+        buyStatus: String(row.buy_status),
+        sellStatus: str(row.sell_status),
+        buyDriftBps: num(row.buy_drift_bps),
+        sellDriftBps: num(row.sell_drift_bps),
+        textileStatus: str(row.textile_status),
+        textileDetail: str(row.textile_detail),
+        elapsedMs: Number(row.elapsed_ms),
+      }))
+  : []
 const refSource = hasTable('reference_gaps')
   ? (db.prepare('SELECT ref_source FROM reference_gaps ORDER BY id DESC LIMIT 1').get() as { ref_source?: SQLOutputValue } | undefined)?.ref_source
   : undefined
@@ -77,9 +103,10 @@ const summary = scanSummary(opps, scanTimes)
 const routes = routeStats(opps, scanTimes)
 const reference = gapStats(gaps)
 const health = venueHealth(scanErrors)
+const shadow = shadowStats(shadowRows)
 
 if (args.json) {
-  console.log(JSON.stringify({ db: dbPath, since: since || null, sources, intervalSec: interval, summary, routes, reference, health, refSource: refSource ?? null }, null, 2))
+  console.log(JSON.stringify({ db: dbPath, since: since || null, sources, intervalSec: interval, summary, routes, reference, health, shadow, refSource: refSource ?? null }, null, 2))
   process.exit(0)
 }
 
@@ -127,6 +154,28 @@ console.log(table(
     bp(row.medianBps), bp(row.p90Bps), bp(row.maxBps), usd(row.bestNetUsd), String(row.episodes), minutes(row.longestRunScans),
   ]),
 ))
+
+console.log('\nShadow execution: the best route walked as live mode would, re-priced at that moment, never signed')
+if (shadow.runs === 0) {
+  console.log('  No shadow runs. Start the desk with SHADOW=1.')
+} else {
+  const outcomeText = Object.entries(shadow.outcomes).map(([outcome, count]) => `${outcome} ${count} (${pct(count / shadow.runs)})`).join(', ')
+  console.log(`  Runs: ${shadow.runs} · ${outcomeText}`)
+  console.log(`  Would-fill net, summed: $${shadow.wouldFillNetUsd.toFixed(2)} · median re-priced net ${bp(shadow.medianNetBps)} bps`)
+  console.log(`  Edge lost between scan and execution, median: ${bp(shadow.medianDecayBps)} bps · median walk time ${shadow.medianElapsedMs === null ? '—' : Math.round(shadow.medianElapsedMs)} ms`)
+  console.log(table(
+    ['Route', 'Runs', 'Would fill', 'Median net', 'Best $'],
+    shadow.routes.slice(0, top).map((row) => [row.route, String(row.runs), pct(row.wouldFillShare), bp(row.medianNetBps), usd(row.bestNetUsd)]),
+  ))
+  console.log(table(
+    ['Leg venue', 'Side', 'Runs', 'Median drift', 'p10 drift'],
+    shadow.drift.map((row) => [row.venue, row.side, String(row.runs), bp(row.medianBps), bp(row.p10Bps)]),
+  ))
+  if (shadow.textile.length) {
+    console.log('  Textile leg: ' + shadow.textile.map((row) => `${row.status} ${row.runs}${row.topDetail ? ` (${row.topDetail})` : ''}`).join(' · '))
+  }
+  console.log('  Drift is the leg\'s rate now against the rate the scan saw; negative moved against us.')
+}
 
 console.log(`\nOn-chain price vs fiat reference${refSource ? ` (${String(refSource)})` : ''}, smallest clip, before gas`)
 if (reference.length === 0) {

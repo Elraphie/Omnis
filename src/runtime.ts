@@ -1,7 +1,9 @@
+import { randomBytes } from 'node:crypto'
 import type { Address, Hex } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import type { ChainClient } from './chain/client.js'
 import { erc20Abi } from 'viem'
-import type { AppConfig } from './config/load.js'
+import type { AppConfig, Secrets } from './config/load.js'
 import { CONTRACTS, token } from './config/tokens.js'
 import {
   assembleQuote,
@@ -15,6 +17,8 @@ import {
 } from './convert/service.js'
 import { runCycle, type CycleDeps, type CycleReport } from './execution/engine.js'
 import { executeLive } from './execution/live.js'
+import { shadowArb, shadowBudget, type ShadowResult } from './execution/shadow.js'
+import type { ArbOpportunity } from './strategies/arbitrage.js'
 import { createReferenceFeed, type ReferenceFeed } from './reference/fx.js'
 import type { TradingSigner } from './chain/signer.js'
 import type { Store } from './store/db.js'
@@ -33,6 +37,29 @@ async function gasPrice(client: ChainClient | null, fallback: bigint): Promise<b
   }
 }
 
+/** Shadow execution bound to one cycle's live adapters and gas price. Null when its hourly budget is spent. */
+export type ShadowRunner = (opp: ArbOpportunity, ctx: { adapters: VenueAdapter[]; gasPriceWei: bigint }) => Promise<ShadowResult | null>
+
+/** Null unless SHADOW=1. With SHADOW_TAKER_KEY the Textile leg is a firm quote; without it, a fresh preview. */
+export function shadowRunnerFor(cfg: AppConfig, secrets: Secrets): ShadowRunner | null {
+  if (!cfg.shadow || cfg.mode === 'live') return null
+  const taker = secrets.shadowTakerKey ? privateKeyToAccount(secrets.shadowTakerKey) : null
+  const allow = shadowBudget(cfg.shadowMaxPerHour)
+  return async (opp, ctx) => {
+    if (!allow()) return null
+    return shadowArb(opp, {
+      adapters: ctx.adapters,
+      slippageBps: cfg.slippageBps,
+      gasPriceWei: ctx.gasPriceWei,
+      celoUsdMicros: cfg.celoUsdMicros,
+      timeoutMs: cfg.quoteTimeoutMs,
+      textileApi: cfg.textileApi,
+      takerSigner: taker,
+      randomNonce: () => `0x${randomBytes(32).toString('hex')}`,
+    }, (venue) => cfg.gasUnits[venue])
+  }
+}
+
 export async function runDeskCycle(args: {
   cfg: AppConfig
   store: Store
@@ -40,6 +67,7 @@ export async function runDeskCycle(args: {
   signer: TradingSigner
   now?: Date
   reference?: ReferenceFeed | null
+  shadow?: ShadowRunner | null
 }): Promise<CycleReport> {
   const gas = await gasPrice(args.client, args.cfg.gasPriceWeiFallback)
   const base: Omit<CycleDeps, 'adapters' | 'quoteSource'> = {
@@ -63,7 +91,14 @@ export async function runDeskCycle(args: {
   if (args.cfg.quoteSource === 'fixture' || !args.client) {
     return runCycle({ ...base, adapters: fallbackAdapters(), quoteSource: 'fixture' })
   }
-  const live = await runCycle({ ...base, adapters: createLiveAdapters(args.client, args.cfg), quoteSource: 'live' })
+  const adapters = createLiveAdapters(args.client, args.cfg)
+  const shadow = args.shadow
+  const live = await runCycle({
+    ...base,
+    adapters,
+    quoteSource: 'live',
+    shadow: shadow ? (opp) => shadow(opp, { adapters, gasPriceWei: gas }) : undefined,
+  })
   // The fixture fallback is a demo aid. In paper or live mode it would book or chase made-up prices,
   // so those modes hold on an empty book instead.
   if (args.cfg.quoteSource === 'auto' && live.quoteCount === 0 && args.cfg.mode === 'dry-run') {

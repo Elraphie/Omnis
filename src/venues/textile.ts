@@ -63,6 +63,94 @@ export interface TextileFirmQuote {
   data: `0x${string}`
 }
 
+/**
+ * The exact text Textile verifies for an `eip191` proof of control (see /v2/openapi.json, takerProof.scheme).
+ * Signing it approves no transfer, trade, or allowance.
+ */
+export function takerProofText(taker: string, chainId: number, nonce: string, issuedAt: number): string {
+  return [
+    'Textile Taker Control',
+    'Version: 1',
+    '',
+    'Sign to prove you control this wallet so Textile can request a firm',
+    'quote for it. This does not approve any transfer, trade or allowance.',
+    '',
+    `Wallet: ${taker.toLowerCase()}`,
+    `Chain: ${chainId}`,
+    `Nonce: ${nonce.toLowerCase()}`,
+    `Issued at: ${issuedAt}`,
+  ].join('\n')
+}
+
+/** Signs Textile's proof-of-control message only. It never sees a transaction. */
+export interface TakerProofSigner {
+  address: `0x${string}`
+  signMessage(args: { message: string }): Promise<`0x${string}`>
+}
+
+export type TextileFirmOutcome =
+  | { status: 'quoted'; firm: TextileFirmQuote; spender: string; latencyMs: number }
+  | { status: 'no_quote' | 'refused' | 'error'; reason: string; latencyMs: number }
+
+/**
+ * Requests a firm, taker-bound quote and always releases it again with /cancel. Measurement only:
+ * the quote is never accepted or settled. Textile checks that the taker holds the sell amount.
+ */
+export async function probeTextileFirm(args: {
+  apiBase: string
+  signer: TakerProofSigner
+  sellToken: string
+  buyToken: string
+  sellAmount: bigint
+  expectedReactor: string
+  timeoutMs: number
+  randomNonce: () => string
+  fetchImpl?: typeof fetch
+}): Promise<TextileFirmOutcome> {
+  const fetcher = args.fetchImpl ?? fetch
+  const base = args.apiBase.replace(/\/$/, '')
+  const started = Date.now()
+  const nonce = args.randomNonce()
+  const issuedAt = Date.now()
+  try {
+    const signature = await args.signer.signMessage({ message: takerProofText(args.signer.address, 42220, nonce, issuedAt) })
+    const response = await fetcher(`${base}/v2/rfq/request`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'omnis/2.0' },
+      body: JSON.stringify({
+        chainId: 42220,
+        sellToken: args.sellToken,
+        buyToken: args.buyToken,
+        sellAmount: args.sellAmount.toString(),
+        taker: args.signer.address,
+        takerProof: { nonce, issuedAt, signature, scheme: 'eip191' },
+      }),
+      signal: AbortSignal.timeout(args.timeoutMs),
+    })
+    const body = await response.json() as {
+      data?: { rfqId?: string; claimToken?: string; status?: string; reason?: string; quote?: { spender?: string } }
+      error?: { message?: string; details?: { reason?: string } }
+    }
+    const latencyMs = Date.now() - started
+    const data = body.data
+    if (data?.rfqId && data.claimToken) {
+      // Release it whatever happens next, so makers are not left holding inventory for a quote we will not fill.
+      await fetcher(`${base}/v2/rfq/${encodeURIComponent(data.rfqId)}/cancel`, {
+        method: 'POST',
+        headers: { 'x-rfq-claim': data.claimToken, 'user-agent': 'omnis/2.0' },
+        signal: AbortSignal.timeout(args.timeoutMs),
+      }).catch(() => undefined)
+    }
+    if (!response.ok) {
+      return { status: 'refused', reason: body.error?.details?.reason ?? body.error?.message ?? `HTTP ${response.status}`, latencyMs }
+    }
+    if (data?.status !== 'quoted') return { status: 'no_quote', reason: data?.reason ?? 'no_quote', latencyMs }
+    return { status: 'quoted', firm: parseTextileFirm(body, args.expectedReactor), spender: String(data.quote?.spender ?? ''), latencyMs }
+  } catch (error) {
+    return { status: 'error', reason: error instanceof Error ? error.message : String(error), latencyMs: Date.now() - started }
+  }
+}
+
 /** Firm quotes are checked against Textile's published Celo reactor before any calldata is returned. */
 export function parseTextileFirm(body: unknown, expectedReactor: string): TextileFirmQuote {
   const root = body as { data?: Record<string, unknown>; error?: { message?: string } }

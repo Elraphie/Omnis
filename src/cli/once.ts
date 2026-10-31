@@ -4,7 +4,7 @@ import { createSigner, createReader } from '../chain/client.js'
 import { loadConfig } from '../config/load.js'
 import { createLogger } from '../log/logger.js'
 import { formatUsd } from '../pricing/math.js'
-import { referenceFeedFor, runDeskCycle } from '../runtime.js'
+import { referenceFeedFor, runDeskCycle, shadowRunnerFor } from '../runtime.js'
 import { Store } from '../store/db.js'
 
 const log = createLogger('omnis')
@@ -24,6 +24,7 @@ const report = await runDeskCycle({
   store,
   client: loaded.cfg.quoteSource === 'fixture' ? null : client,
   signer,
+  shadow: shadowRunnerFor(loaded.cfg, loaded.secrets),
   reference: referenceFeedFor(loaded.cfg, (message) => log.warn('reference rates unavailable', { message })),
 })
 store.close()
@@ -50,6 +51,15 @@ if (best) {
 if (report.basis[0]) {
   const basis = report.basis[0]
   console.log(`Naira basis: ${basis.left} vs ${basis.right} gap ${basis.gapBps ?? 'n/a'} bps (tradable ${basis.tradable})`)
+}
+if (report.shadow) {
+  const shadow = report.shadow
+  const net = shadow.netUsd === null ? 'n/a' : `${shadow.netUsd.toFixed(4)} USD (${shadow.netBps} bps)`
+  console.log(`Shadow: ${shadow.outcome} ${shadow.corridor} ${shadow.buyVenue} -> ${shadow.sellVenue} $${shadow.sizeUsd} net ${net}; the scan said ${shadow.scanNetBps} bps`)
+  for (const leg of shadow.legs) {
+    const drift = leg.driftBps === null ? 'n/a' : `${leg.driftBps.toFixed(1)} bps`
+    console.log(`  ${leg.venue} ${leg.tokenIn}->${leg.tokenOut}: ${leg.status}, drift ${drift}, ${leg.latencyMs}ms${leg.built ? ', calldata built' : ''}${leg.detail ? ` · ${leg.detail}` : ''}`)
+  }
 }
 if (report.trade) console.log(`Paper fill: ${report.trade.strategy} ${report.trade.pair} pnl ${report.trade.pnlUsd.toFixed(4)}`)
 if (report.venueErrors.length) console.log(`Venue errors: ${report.venueErrors.length} (see logs)`)

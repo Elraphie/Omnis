@@ -123,6 +123,28 @@ export class Store {
         ref_as_of TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS reference_gaps_ts ON reference_gaps (ts);
+      CREATE TABLE IF NOT EXISTS shadow_trades (
+        id INTEGER PRIMARY KEY,
+        ts TEXT NOT NULL,
+        corridor TEXT NOT NULL,
+        buy_venue TEXT NOT NULL,
+        sell_venue TEXT NOT NULL,
+        size_usd REAL NOT NULL,
+        scan_net_usd REAL NOT NULL,
+        scan_net_bps REAL NOT NULL,
+        outcome TEXT NOT NULL,
+        net_usd REAL,
+        net_bps REAL,
+        buy_status TEXT NOT NULL,
+        sell_status TEXT,
+        buy_drift_bps REAL,
+        sell_drift_bps REAL,
+        textile_status TEXT,
+        textile_detail TEXT,
+        all_built INTEGER NOT NULL,
+        elapsed_ms INTEGER NOT NULL,
+        payload TEXT NOT NULL
+      );
     `)
   }
 
@@ -239,6 +261,24 @@ export class Store {
         insert.run(ts, quoteSource, row.corridor, row.venue, row.side, row.sizeUsd, row.onchainPerUsd, row.refPerUsd, row.gapBps, ref.source, ref.asOf)
       }
     })
+  }
+
+  insertShadow(ts: string, row: {
+    corridor: string; buyVenue: string; sellVenue: string; sizeUsd: number; scanNetUsd: number; scanNetBps: number
+    outcome: string; netUsd: number | null; netBps: number | null; elapsedMs: number
+    legs: { venue: string; status: string; driftBps: number | null; built: boolean; detail: string }[]
+  }): void {
+    const [buy, sell] = row.legs
+    const textile = row.legs.find((leg) => leg.venue === 'textile-rfq')
+    // A Textile preview has no calldata to build; only the on-chain legs and a firm Textile leg count.
+    const allBuilt = row.legs.length === 2 && row.legs.every((leg) => leg.built || leg.status === 'preview_only')
+    this.db.prepare(`INSERT INTO shadow_trades (ts, corridor, buy_venue, sell_venue, size_usd, scan_net_usd, scan_net_bps, outcome, net_usd, net_bps,
+      buy_status, sell_status, buy_drift_bps, sell_drift_bps, textile_status, textile_detail, all_built, elapsed_ms, payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      ts, row.corridor, row.buyVenue, row.sellVenue, row.sizeUsd, row.scanNetUsd, row.scanNetBps, row.outcome, row.netUsd, row.netBps,
+      buy?.status ?? 'error', sell?.status ?? null, buy?.driftBps ?? null, sell?.driftBps ?? null,
+      textile?.status ?? null, textile?.detail || null, allBuilt ? 1 : 0, row.elapsedMs, jsonSafe(row),
+    )
   }
 
   insertDecision(row: { ts: string; strategy: string; action: string; reason: string; payload: unknown }): void {

@@ -59,6 +59,10 @@ const envSchema = z.object({
   GAS_UNITS_MENTO: z.coerce.number().int().positive().default(220_000),
   GAS_UNITS_MENTO_V3: z.coerce.number().int().positive().default(220_000),
   STARTUP_DELAY_SEC: z.coerce.number().nonnegative().default(0),
+  SHADOW: z.enum(['0', '1']).default('0'),
+  SHADOW_MIN_NET_BPS: z.coerce.number().int().min(-10_000).max(10_000).default(0),
+  SHADOW_MAX_PER_HOUR: z.coerce.number().int().positive().max(600).default(20),
+  SHADOW_TAKER_KEY: z.string().optional(),
 })
 
 export interface ApiKeyRecord {
@@ -116,10 +120,16 @@ export interface AppConfig {
   targetUsdtBps: bigint
   gasUnits: Record<VenueId, bigint>
   startupDelaySec: number
+  /** Walk the best route as live mode would, without signing. Dry-run and paper only. */
+  shadow: boolean
+  shadowMinNetBps: bigint
+  shadowMaxPerHour: number
 }
 
 export interface Secrets {
   agentPrivateKey?: Hex
+  /** Signs Textile proof-of-control messages in shadow mode. Never a transaction. */
+  shadowTakerKey?: Hex
 }
 
 export interface LoadedConfig {
@@ -238,6 +248,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     signerKind = 'readonly'
   }
   if (raw.MIN_TRADE_USD > raw.MAX_TRADE_USD) throw new Error('MIN_TRADE_USD cannot exceed MAX_TRADE_USD')
+  const shadowKey = raw.SHADOW_TAKER_KEY?.trim()
+  if (raw.SHADOW === '1' && raw.MODE === 'live') throw new Error('SHADOW is for dry-run and paper. Live mode does not shadow.')
+  if (shadowKey) {
+    if (!PRIVATE_KEY.test(shadowKey)) throw new Error('SHADOW_TAKER_KEY must be a 32-byte hex key')
+    if (privateKey && shadowKey.toLowerCase() === privateKey.toLowerCase()) {
+      throw new Error('SHADOW_TAKER_KEY must not be the trading key. Use a separate wallet for shadow quotes.')
+    }
+  }
 
   const gasUnits = {
     'uniswap-v3': BigInt(raw.GAS_UNITS_UNISWAP),
@@ -296,10 +314,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     targetUsdtBps: BigInt(raw.TARGET_USDT_BPS),
     gasUnits,
     startupDelaySec: raw.STARTUP_DELAY_SEC,
+    shadow: raw.SHADOW === '1',
+    shadowMinNetBps: BigInt(raw.SHADOW_MIN_NET_BPS),
+    shadowMaxPerHour: raw.SHADOW_MAX_PER_HOUR,
   }
+  const secrets: Secrets = cfg.mode === 'live' && privateKey ? { agentPrivateKey: privateKey as Hex } : {}
+  if (cfg.shadow && shadowKey) secrets.shadowTakerKey = shadowKey as Hex
   return {
     cfg,
-    secrets: cfg.mode === 'live' && privateKey ? { agentPrivateKey: privateKey as Hex } : {},
+    secrets,
     privateKeyPresent: Boolean(privateKey),
   }
 }
@@ -321,6 +344,8 @@ export function publicConfig(cfg: AppConfig) {
     treasury: cfg.treasury,
     quoteSource: cfg.quoteSource,
     fxReference: cfg.fxReferenceUrl ? new URL(cfg.fxReferenceUrl).host : null,
+    shadow: cfg.shadow,
+    shadowMaxPerHour: cfg.shadowMaxPerHour,
     signer: cfg.signerKind,
     attributionTag: cfg.attributionTag || null,
     includeExtended: cfg.includeExtended,

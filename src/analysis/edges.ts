@@ -166,6 +166,93 @@ export function venueHealth(scanErrors: { venue: string; message: string }[][]):
   })).sort((a, b) => b.errors - a.errors)
 }
 
+export interface ShadowRow {
+  corridor: string
+  buyVenue: string
+  sellVenue: string
+  sizeUsd: number
+  scanNetBps: number
+  outcome: string
+  netUsd: number | null
+  netBps: number | null
+  buyStatus: string
+  sellStatus: string | null
+  buyDriftBps: number | null
+  sellDriftBps: number | null
+  textileStatus: string | null
+  textileDetail: string | null
+  elapsedMs: number
+}
+
+export interface ShadowStats {
+  runs: number
+  outcomes: Record<string, number>
+  wouldFillNetUsd: number
+  medianNetBps: number | null
+  /** Scan net minus re-priced net, per run with both legs priced: edge lost between seeing and acting. */
+  medianDecayBps: number | null
+  medianElapsedMs: number | null
+  drift: { venue: string; side: 'buy' | 'sell'; runs: number; medianBps: number | null; p10Bps: number | null }[]
+  textile: { status: string; runs: number; topDetail: string }[]
+  routes: { route: string; runs: number; wouldFillShare: number; medianNetBps: number | null; bestNetUsd: number | null }[]
+}
+
+export function shadowStats(rows: ShadowRow[]): ShadowStats {
+  const sorted = (values: number[]) => [...values].sort((a, b) => a - b)
+  const outcomes: Record<string, number> = {}
+  for (const row of rows) outcomes[row.outcome] = (outcomes[row.outcome] ?? 0) + 1
+  const priced = rows.filter((row) => row.netBps !== null)
+  const drift = new Map<string, { venue: string; side: 'buy' | 'sell'; values: number[] }>()
+  const addDrift = (venue: string, side: 'buy' | 'sell', value: number | null) => {
+    if (value === null) return
+    const key = `${venue}|${side}`
+    const entry = drift.get(key) ?? { venue, side, values: [] }
+    entry.values.push(value)
+    drift.set(key, entry)
+  }
+  const textile = new Map<string, { runs: number; details: Map<string, number> }>()
+  const routes = new Map<string, ShadowRow[]>()
+  for (const row of rows) {
+    addDrift(row.buyVenue, 'buy', row.buyDriftBps)
+    addDrift(row.sellVenue, 'sell', row.sellDriftBps)
+    if (row.textileStatus) {
+      const entry = textile.get(row.textileStatus) ?? { runs: 0, details: new Map<string, number>() }
+      entry.runs += 1
+      if (row.textileDetail) entry.details.set(row.textileDetail, (entry.details.get(row.textileDetail) ?? 0) + 1)
+      textile.set(row.textileStatus, entry)
+    }
+    const key = routeKey(row)
+    routes.set(key, [...(routes.get(key) ?? []), row])
+  }
+  return {
+    runs: rows.length,
+    outcomes,
+    wouldFillNetUsd: rows.filter((row) => row.outcome === 'would_fill').reduce((sum, row) => sum + (row.netUsd ?? 0), 0),
+    medianNetBps: quantile(sorted(priced.map((row) => row.netBps!)), 0.5),
+    medianDecayBps: quantile(sorted(priced.map((row) => row.scanNetBps - row.netBps!)), 0.5),
+    medianElapsedMs: quantile(sorted(rows.map((row) => row.elapsedMs)), 0.5),
+    drift: [...drift.values()].map((entry) => {
+      const values = sorted(entry.values)
+      return { venue: entry.venue, side: entry.side, runs: values.length, medianBps: quantile(values, 0.5), p10Bps: quantile(values, 0.1) }
+    }).sort((a, b) => a.venue.localeCompare(b.venue) || a.side.localeCompare(b.side)),
+    textile: [...textile].map(([status, entry]) => ({
+      status,
+      runs: entry.runs,
+      topDetail: [...entry.details].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '',
+    })).sort((a, b) => b.runs - a.runs),
+    routes: [...routes].map(([route, group]) => {
+      const nets = group.filter((row) => row.netBps !== null)
+      return {
+        route,
+        runs: group.length,
+        wouldFillShare: group.filter((row) => row.outcome === 'would_fill').length / group.length,
+        medianNetBps: quantile(sorted(nets.map((row) => row.netBps!)), 0.5),
+        bestNetUsd: nets.length ? Math.max(...nets.map((row) => row.netUsd ?? -Infinity)) : null,
+      }
+    }).sort((a, b) => b.runs - a.runs),
+  }
+}
+
 export interface GapStats {
   corridor: string
   venue: string

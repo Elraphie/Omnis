@@ -2,6 +2,7 @@ import type { AppConfig } from '../config/load.js'
 import { activeCorridors, TOKENS, token, venuesForPair, type VenueId } from '../config/tokens.js'
 import { gasCostUsdMicros, ladderSizes, microsToNumber } from '../pricing/math.js'
 import { referenceGaps, type ReferenceGap, type ReferenceRates } from '../reference/fx.js'
+import { shadowCandidate, shadowView, type ShadowResult, type ShadowView } from './shadow.js'
 import { killReason, reviewOpenRisk, reviewReduceRisk, shouldTripLossStop } from '../risk/guards.js'
 import { findArbs, type ArbOpportunity, type PricedQuote } from '../strategies/arbitrage.js'
 import { bestBid, buildMmQuotes, fxRebalance, inventoryMarks, nairaBasis, priceOf, type BasisRow, type MmQuote } from '../strategies/book.js'
@@ -43,6 +44,8 @@ export interface CycleReport {
     balances: Record<string, string>
   }
   trade: { strategy: string; pair: string; pnlUsd: number } | null
+  /** What live execution would have met on this cycle's best route. Null when shadow mode is off or skipped. */
+  shadow: ShadowView | null
 }
 
 export interface CycleDeps {
@@ -55,6 +58,11 @@ export interface CycleDeps {
   now?: Date
   /** Fiat rates per USD to measure on-chain prices against. Measurement only; no decision reads it. */
   reference?: ReferenceRates | null
+  /**
+   * Shadow execution for dry-run and paper on live quotes. Returns null when its hourly budget is spent.
+   * It never signs; live mode never calls it.
+   */
+  shadow?: (opp: ArbOpportunity) => Promise<ShadowResult | null>
   /** Called only when mode is live and a broadcastable route exists. */
   broadcaster?: (opp: ArbOpportunity) => Promise<void>
 }
@@ -313,6 +321,16 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     }
   }
 
+  let shadow: ShadowView | null = null
+  if (deps.shadow && cfg.mode !== 'live' && deps.quoteSource === 'live') {
+    const candidate = shadowCandidate(opps, cfg.shadowMinNetBps)
+    const result = candidate ? await deps.shadow(candidate) : null
+    if (result) {
+      shadow = shadowView(result)
+      store.insertShadow(ts, shadow)
+    }
+  }
+
   const after = inventoryMarks(store.balances(), quotes)
   const equity = after.totalUsd
   const realized = store.realized()
@@ -357,5 +375,6 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
       balances: balanceView,
     },
     trade,
+    shadow,
   }
 }

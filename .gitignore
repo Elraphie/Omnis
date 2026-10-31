@@ -9,3 +9,4 @@ data
 agent-tools
 .DS_Store
 coverage
+data-*/

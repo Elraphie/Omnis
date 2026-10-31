@@ -107,6 +107,14 @@ npm run report -- --json
 
 The report shows venue health, how often any round trip clears gas and the cushion, an upper bound on what one fill per scan would have made, per-route frequency and size of edges with how long they stayed open, and the on-chain premium or discount against the reference per corridor, venue, and side. Fixture scans are excluded unless you pass `--include-fixture`. The default reference is a once-a-day rate, so it measures lasting premiums, not intraday lag.
 
+### Shadow execution
+
+`SHADOW=1` (dry-run or paper only, live quotes only) takes each scan's best round trip that clears `SHADOW_MIN_NET_BPS` and walks it the way live mode would, at most `SHADOW_MAX_PER_HOUR` times an hour. It re-prices leg one, sizes leg two from leg one's guaranteed minimum, re-prices leg two, builds each on-chain leg's calldata, and records the outcome (`would_fill`, `edge_gone`, `leg_failed`), the re-priced net, each leg's drift from the scan, and timing in `shadow_trades`. It never signs or sends a transaction. `npm run report` summarises it.
+
+The Textile leg is a fresh preview unless `SHADOW_TAKER_KEY` is set. With it, Omnis signs Textile's proof-of-control message (an off-chain text that, in Textile's words, does not approve any transfer, trade or allowance), requests a firm quote, records it, and releases it straight away with `/cancel`. Textile only firm-quotes a taker that holds the sell amount, so that wallet needs a small balance of what it sells. Shadow mode never moves those funds, but the key is a hot key: use a dedicated wallet holding only what the measurement needs, never the trading key (startup refuses that), and keep the key in `.env`, never in the repository.
+
+`npm run measure` runs the desk for measurement and restarts it if it stops: paper mode, live quotes, shadow on, sizes up to $1,000, the desk page on 127.0.0.1, data and `desk.log` in `./data-measure`. Values in your environment or `.env` override those defaults. On Windows PowerShell, use `npm.cmd` if script execution is disabled.
+
 ### Paper and dry-run
 
 Dry-run records the decision and does not move a balance. Paper starts from `PAPER_USDT` (default 1000), applies a round trip at the quoted output minus gas, and stores equity in SQLite under `DATA_DIR`. Both modes use read-only RPC calls. Tests use an in-memory database and a fixture book, so `npm test` does not need a network or a key.
@@ -133,6 +141,10 @@ Even then, the desk will not broadcast a Textile preview. A preview is not a fil
 | `HOST` | `0.0.0.0` | Bind address. `127.0.0.1` for a local-only desk |
 | `FX_REFERENCE_URL` | `https://open.er-api.com/v6/latest/USD` | Fiat reference for measurement. `off` disables |
 | `FX_REFERENCE_TTL_SEC` | `3600` | How long reference rates are cached |
+| `SHADOW` | `0` | `1` walks the best route each scan as live mode would, without signing. Dry-run and paper only |
+| `SHADOW_MIN_NET_BPS` | `0` | Only shadow a route whose scanned net (after the cushion) is at least this |
+| `SHADOW_MAX_PER_HOUR` | `20` | Cap on shadow runs in any rolling hour |
+| `SHADOW_TAKER_KEY` | | Optional dedicated wallet that signs Textile proof-of-control for firm quotes. Never the trading key |
 | `DATA_DIR` | `./data` | SQLite directory |
 | `MIN_EDGE_USD` | `0.05` | Minimum net dollars |
 | `MIN_EDGE_BPS` | `3` | Minimum net basis points |
