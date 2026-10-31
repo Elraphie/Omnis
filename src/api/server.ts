@@ -5,6 +5,7 @@ import type { CycleReport } from '../execution/engine.js'
 import type { Store } from '../store/db.js'
 import { utcDay } from '../util.js'
 import { corsHeaders } from './cors.js'
+import { buildDashboard, DASHBOARD_HOURS, type Dashboard, type WalletView } from './dashboard.js'
 import { renderMetrics } from './metrics.js'
 import { statusPage } from './page.js'
 import { RateLimiter } from './rate-limit.js'
@@ -17,6 +18,8 @@ export interface ServerDeps {
   getReport: () => CycleReport | null
   quoteConvert: (from: string, to: string, amount: string) => Promise<ConvertQuote>
   buildConvert: (body: unknown) => Promise<unknown>
+  /** The shadow wallet's address and balances, when one is configured. Callers cache it. */
+  wallet?: () => Promise<WalletView | null>
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -35,7 +38,8 @@ function readBody(req: IncomingMessage): Promise<string> {
 }
 
 /** Desk internals: P&L, balances, limits, treasury, key usage. Operators only unless PUBLIC_STATUS=1. */
-const OPS_PATHS = new Set(['/status', '/trades', '/pnl', '/metrics'])
+const OPS_PATHS = new Set(['/status', '/trades', '/pnl', '/metrics', '/dashboard'])
+const DASHBOARD_CACHE_MS = 10_000
 
 function presentedKey(req: IncomingMessage): string | undefined {
   return (typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined)
@@ -55,6 +59,7 @@ function send(res: ServerResponse, code: number, body: unknown, headers: Record<
 
 export function createHandler(deps: ServerDeps) {
   const started = Date.now()
+  const dashboards = new Map<number, { at: number; body: Dashboard }>()
   return async (req: IncomingMessage, res: ServerResponse) => {
     const host = req.headers.host
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined
@@ -111,6 +116,20 @@ export function createHandler(deps: ServerDeps) {
           recentTrades: deps.store.recentTrades(20),
           counts: deps.store.counts(),
         }, cors)
+        return
+      }
+      if (req.method === 'GET' && url.pathname === '/dashboard') {
+        const asked = Number(url.searchParams.get('hours') ?? 24)
+        const hours = (DASHBOARD_HOURS as readonly number[]).includes(asked) ? asked : 24
+        const cached = dashboards.get(hours)
+        if (cached && Date.now() - cached.at < DASHBOARD_CACHE_MS) {
+          send(res, 200, cached.body, cors)
+          return
+        }
+        const wallet = deps.wallet ? await deps.wallet().catch(() => null) : null
+        const body = buildDashboard({ cfg: deps.cfg, store: deps.store, report: deps.getReport(), hours, startedAt: started, wallet })
+        dashboards.set(hours, { at: Date.now(), body })
+        send(res, 200, body, cors)
         return
       }
       if (req.method === 'GET' && url.pathname === '/trades') {

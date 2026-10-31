@@ -79,6 +79,7 @@ Copy `.env.example` to `.env` when you want a fee, an API key, or a different RP
 |---|---|---|---|
 | GET | `/` | no | Desk page |
 | GET | `/health` | no | Liveness |
+| GET | `/dashboard?hours=24` | admin key | Everything the desk page shows for a 6, 24, 72 or 168 hour window. Cached 10s |
 | GET | `/status` | admin key | Last scan, decision, config, recent paper trades |
 | GET | `/trades` | admin key | Recent fills |
 | GET | `/pnl` | admin key | Realized P&L and balances |
@@ -94,6 +95,20 @@ Every Convert response carries `quoteSource`. Convert never falls back from live
 The fee is `CONVERT_FEE_BPS` of the input, sent to `TREASURY_ADDRESS` as an ERC-20 transfer the user signs, then an exact approval and the swap for the remainder. It is not atomic: a wallet can drop the transfer and still swap. Say so to users. Set the fee to 0 until the treasury address is yours. The dead address in a demo config burns fees.
 
 Approvals are the exact swap amount. A non-zero USDT allowance is reset to zero first. `maxUint256` is refused.
+
+### Desk page
+
+`GET /` is the desk console, at http://127.0.0.1:43123 when you run `npm run measure` or `npm run dev`. It refreshes every 15 seconds from `/dashboard` and shows:
+
+- mode, quote source, risk state, shadow mode, last and next scan, and uptime
+- headline figures: paper equity, best edge in the last scan, how often scans find a positive edge, the upper bound, shadow outcomes, and Textile's error rate
+- best net edge per scan and paper realized P&L over the chosen window (6h, 24h, 3d, 7d), each with a table view
+- the corridor scanner for the last scan, with a trade, watch, or no-edge signal per route
+- the shadow execution log, leg by leg
+- per-route edge frequency, and on-chain prices against the fiat reference
+- risk parameters, system state, the shadow wallet's balances, paper trades, and venue contracts with Celoscan links
+
+The page holds no data itself. It asks for an admin key unless `PUBLIC_STATUS=1`, and follows the system light or dark setting.
 
 ### Measuring the edge
 

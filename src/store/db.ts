@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
+import type { Queryable } from '../analysis/load.js'
 import { jsonSafe } from '../util.js'
 
 function asBigint(value: SQLOutputValue | undefined): bigint {
@@ -161,6 +162,11 @@ export class Store {
 
   close(): void {
     this.db.close()
+  }
+
+  /** Read access for the analysis loaders in src/analysis/load.ts. */
+  get reader(): Queryable {
+    return this.db
   }
 
   getKv(key: string): string | null {

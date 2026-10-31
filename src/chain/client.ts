@@ -11,6 +11,7 @@ export interface ChainClient {
   simulateContract(args: Record<string, unknown>): Promise<{ result: unknown }>
   call(args: { to: `0x${string}`; data?: Hex }): Promise<{ data?: Hex }>
   getGasPrice(): Promise<bigint>
+  getBalance(args: { address: `0x${string}` }): Promise<bigint>
   waitForTransactionReceipt(args: { hash: Hex }): Promise<{ status: string }>
 }
 
@@ -27,6 +28,7 @@ export function createReader(rpcUrl: string): ChainClient {
     },
     call: (args) => client.call(args),
     getGasPrice: () => client.getGasPrice(),
+    getBalance: (args) => client.getBalance(args),
     waitForTransactionReceipt: async (args) => {
       const receipt = await client.waitForTransactionReceipt(args)
       return { status: receipt.status }

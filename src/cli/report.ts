@@ -4,8 +4,9 @@ import { join } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { parseArgs } from 'node:util'
 import {
-  gapStats, medianIntervalSec, routeStats, scanSummary, shadowStats, venueHealth, type GapRow, type OppRow, type ShadowRow,
+  gapStats, medianIntervalSec, routeStats, scanSummary, shadowStats, venueHealth,
 } from '../analysis/edges.js'
+import { loadAnalysisRows } from '../analysis/load.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -31,68 +32,8 @@ const top = Math.max(1, Number(args.top) || 15)
 const since = hours === null ? '' : new Date(Date.now() - hours * 3_600_000).toISOString()
 const sources = args['include-fixture'] ? ['live', 'fixture'] : ['live']
 const db = new DatabaseSync(dbPath, { readOnly: true })
-
-function rows(sql: string): Record<string, SQLOutputValue>[] {
-  return db.prepare(sql).all(since, ...sources) as Record<string, SQLOutputValue>[]
-}
-const sourceFilter = `quote_source IN (${sources.map(() => '?').join(', ')})`
+const { scanTimes, scanErrors, opps, gaps, shadow: shadowRows } = loadAnalysisRows(db, since, sources)
 const hasTable = (name: string) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name))
-
-const scanRows = rows(`SELECT ts, payload FROM scans WHERE ts >= ? AND ${sourceFilter} ORDER BY ts`)
-const scanTimes = scanRows.map((row) => String(row.ts))
-const scanErrors = scanRows.map((row) => {
-  try {
-    const errors = (JSON.parse(String(row.payload)) as { errors?: { venue: string; message: string }[] }).errors
-    return Array.isArray(errors) ? errors : []
-  } catch {
-    return []
-  }
-})
-const opps: OppRow[] = hasTable('opportunities')
-  ? rows(`SELECT ts, corridor, buy_venue, sell_venue, size_usd, net_usd, net_bps FROM opportunities WHERE ts >= ? AND ${sourceFilter}`).map((row) => ({
-      ts: String(row.ts),
-      corridor: String(row.corridor),
-      buyVenue: String(row.buy_venue),
-      sellVenue: String(row.sell_venue),
-      sizeUsd: Number(row.size_usd),
-      netUsd: Number(row.net_usd),
-      netBps: Number(row.net_bps),
-    }))
-  : []
-const gaps: GapRow[] = hasTable('reference_gaps')
-  ? rows(`SELECT ts, corridor, venue, side, gap_bps, ref_as_of FROM reference_gaps WHERE ts >= ? AND ${sourceFilter}`).map((row) => ({
-      ts: String(row.ts),
-      corridor: String(row.corridor),
-      venue: String(row.venue),
-      side: String(row.side),
-      gapBps: Number(row.gap_bps),
-      refAsOf: String(row.ref_as_of),
-    }))
-  : []
-const num = (value: SQLOutputValue | undefined) => (value === null || value === undefined ? null : Number(value))
-const str = (value: SQLOutputValue | undefined) => (value === null || value === undefined ? null : String(value))
-// Shadow runs only ever use live quotes, so they take the time filter alone.
-const shadowRows: ShadowRow[] = hasTable('shadow_trades')
-  ? (db.prepare(`SELECT corridor, buy_venue, sell_venue, size_usd, scan_net_bps, outcome, net_usd, net_bps, buy_status, sell_status,
-      buy_drift_bps, sell_drift_bps, textile_status, textile_detail, elapsed_ms FROM shadow_trades WHERE ts >= ?`).all(since) as Record<string, SQLOutputValue>[])
-      .map((row) => ({
-        corridor: String(row.corridor),
-        buyVenue: String(row.buy_venue),
-        sellVenue: String(row.sell_venue),
-        sizeUsd: Number(row.size_usd),
-        scanNetBps: Number(row.scan_net_bps),
-        outcome: String(row.outcome),
-        netUsd: num(row.net_usd),
-        netBps: num(row.net_bps),
-        buyStatus: String(row.buy_status),
-        sellStatus: str(row.sell_status),
-        buyDriftBps: num(row.buy_drift_bps),
-        sellDriftBps: num(row.sell_drift_bps),
-        textileStatus: str(row.textile_status),
-        textileDetail: str(row.textile_detail),
-        elapsedMs: Number(row.elapsed_ms),
-      }))
-  : []
 const refSource = hasTable('reference_gaps')
   ? (db.prepare('SELECT ref_source FROM reference_gaps ORDER BY id DESC LIMIT 1').get() as { ref_source?: SQLOutputValue } | undefined)?.ref_source
   : undefined

@@ -14,6 +14,7 @@ const deadRpc: ChainClient = {
   simulateContract: async () => { throw new Error('rpc down') },
   call: async () => { throw new Error('rpc down') },
   getGasPrice: async () => { throw new Error('rpc down') },
+  getBalance: async () => { throw new Error('rpc down') },
   waitForTransactionReceipt: async () => { throw new Error('rpc down') },
 }
 

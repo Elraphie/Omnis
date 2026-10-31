@@ -1,6 +1,9 @@
 import 'dotenv/config'
 import { join } from 'node:path'
+import { erc20Abi, formatUnits } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import type { WalletView } from '../api/dashboard.js'
+import { TOKENS } from '../config/tokens.js'
 import { startServer } from '../api/server.js'
 import { RateLimiter } from '../api/rate-limit.js'
 import { createReader, createSigner } from '../chain/client.js'
@@ -30,6 +33,23 @@ if (shadow) {
     textileLeg: loaded.secrets.shadowTakerKey ? 'firm quote' : 'preview only',
     shadowWallet: loaded.secrets.shadowTakerKey ? privateKeyToAccount(loaded.secrets.shadowTakerKey).address : null,
   })
+}
+const shadowAddress = loaded.secrets.shadowTakerKey ? privateKeyToAccount(loaded.secrets.shadowTakerKey).address : null
+let walletCache: { at: number; view: WalletView } | null = null
+/** The shadow wallet's balances for the desk page, read at most once a minute. */
+async function wallet(): Promise<WalletView | null> {
+  if (!shadowAddress) return null
+  if (walletCache && Date.now() - walletCache.at < 60_000) return walletCache.view
+  const balances: Record<string, string> = {
+    CELO: formatUnits(await client.getBalance({ address: shadowAddress }), 18),
+  }
+  for (const symbol of ['USDT', 'wARS', 'cNGN', 'wBRL'] as const) {
+    const info = TOKENS[symbol]
+    const raw = await client.readContract({ address: info.address, abi: erc20Abi, functionName: 'balanceOf', args: [shadowAddress] }) as bigint
+    balances[symbol] = formatUnits(raw, info.decimals)
+  }
+  walletCache = { at: Date.now(), view: { address: shadowAddress, balances, checkedAt: new Date().toISOString() } }
+  return walletCache.view
 }
 let report: CycleReport | null = null
 let running = false
@@ -72,6 +92,7 @@ const server = startServer({
   getReport: () => report,
   quoteConvert: (from, to, amount) => convert.quote(from, to, amount),
   buildConvert: (body) => convert.build(body),
+  wallet,
 })
 
 server.listen(loaded.cfg.port, loaded.cfg.host, () => {
