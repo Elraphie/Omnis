@@ -69,7 +69,7 @@ npm run dev           # desk plus HTTP on port 43123
 npm run build && npm start
 ```
 
-`npm run once` and `npm run dev` default to dry-run. Set `MODE=paper` to simulate fills and write P&L. If `QUOTE_SOURCE=auto` and every venue fails, the cycle falls back to a fixture book and says so. Fixture numbers are not live prices.
+`npm run once` and `npm run dev` default to dry-run. Set `MODE=paper` to simulate fills and write P&L. In dry-run, if `QUOTE_SOURCE=auto` and every venue fails, the cycle falls back to a fixture book and says so. Paper and live never fall back: they hold on an empty book, so paper P&L is only ever booked from live quotes (or from `QUOTE_SOURCE=fixture`, which you chose on purpose). Fixture numbers are not live prices. To see the desk page locally, set `PUBLIC_STATUS=1` or enter a key from `ADMIN_KEYS`.
 
 Copy `.env.example` to `.env` when you want a fee, an API key, or a different RPC. A private key is not required. If one is present and the mode is not live, it is ignored and a warning is logged.
 
@@ -79,19 +79,56 @@ Copy `.env.example` to `.env` when you want a fee, an API key, or a different RP
 |---|---|---|---|
 | GET | `/` | no | Desk page |
 | GET | `/health` | no | Liveness |
-| GET | `/status` | no | Last scan, decision, config, recent paper trades |
-| GET | `/trades` | no | Recent fills |
-| GET | `/pnl` | no | Realized P&L and balances |
-| GET | `/metrics` | no | Prometheus text |
+| GET | `/dashboard?hours=24` | admin key | Everything the desk page shows for a 6, 24, 72 or 168 hour window. Cached 10s |
+| GET | `/status` | admin key | Last scan, decision, config, recent paper trades |
+| GET | `/trades` | admin key | Recent fills |
+| GET | `/pnl` | admin key | Realized P&L and balances |
+| GET | `/metrics` | admin key | Prometheus text |
 | GET | `/convert/quote?from=USDT&to=wBRL&amount=100` | API key | Best route after the fee |
 | POST | `/convert/build` | API key | Unsigned steps for `wallet` |
-| POST | `/admin/kill` | API key | `{ "enabled": true }` manual kill switch |
+| POST | `/admin/kill` | admin key | `{ "enabled": true }` manual kill switch |
 
-Send the key as `Authorization: Bearer <key>` or `x-api-key`. Keys are stored only as SHA-256; logs keep a short id. Empty `API_KEYS` disables Convert. CORS echoes an allowed origin and never `*`. Requests with no `Origin` (server-side calls) are accepted. Same-host browser calls are accepted. Anything else needs `CORS_ORIGINS`. The default limit is 60 Convert or admin requests per key per minute.
+Send the key as `Authorization: Bearer <key>` or `x-api-key`. Keys are stored only as SHA-256; logs keep a short id. Empty `API_KEYS` disables Convert. Admin keys (`ADMIN_KEYS`) are separate from Convert keys, cannot reuse one, and are not rate limited, so a Convert customer can never reach the kill switch or the desk's P&L. `PUBLIC_STATUS=1` opens the status endpoints without a key for local development; do not set it in production.
+
+Every Convert response carries `quoteSource`. Convert never falls back from live prices to the fixture book: with no live route, `best` is null. `/convert/build` refuses fixture prices outright. CORS echoes an allowed origin and never `*`. Requests with no `Origin` (server-side calls) are accepted. Same-host browser calls are accepted. Anything else needs `CORS_ORIGINS`. The default limit is 60 Convert or admin requests per key per minute.
 
 The fee is `CONVERT_FEE_BPS` of the input, sent to `TREASURY_ADDRESS` as an ERC-20 transfer the user signs, then an exact approval and the swap for the remainder. It is not atomic: a wallet can drop the transfer and still swap. Say so to users. Set the fee to 0 until the treasury address is yours. The dead address in a demo config burns fees.
 
 Approvals are the exact swap amount. A non-zero USDT allowance is reset to zero first. `maxUint256` is refused.
+
+### Desk page
+
+`GET /` is the desk console, at http://127.0.0.1:43123 when you run `npm run measure` or `npm run dev`. It refreshes every 15 seconds from `/dashboard` and shows:
+
+- mode, quote source, risk state, shadow mode, last and next scan, and uptime
+- headline figures: paper equity, best edge in the last scan, how often scans find a positive edge, the upper bound, shadow outcomes, and Textile's error rate
+- best net edge per scan and paper realized P&L over the chosen window (6h, 24h, 3d, 7d), each with a table view
+- the corridor scanner for the last scan, with a trade, watch, or no-edge signal per route
+- the shadow execution log, leg by leg
+- per-route edge frequency, and on-chain prices against the fiat reference
+- risk parameters, system state, the shadow wallet's balances, paper trades, and venue contracts with Celoscan links
+
+The page holds no data itself. It asks for an admin key unless `PUBLIC_STATUS=1`, and follows the system light or dark setting.
+
+### Measuring the edge
+
+Every scan stores each round trip it priced (table `opportunities`) and, when `FX_REFERENCE_URL` is set, each venue's price against a fiat reference at the smallest clip (table `reference_gaps`). Let the desk run on live quotes, then summarise:
+
+```bash
+npm run report
+npm run report -- --hours 24 --top 20
+npm run report -- --json
+```
+
+The report shows venue health, how often any round trip clears gas and the cushion, an upper bound on what one fill per scan would have made, per-route frequency and size of edges with how long they stayed open, and the on-chain premium or discount against the reference per corridor, venue, and side. Fixture scans are excluded unless you pass `--include-fixture`. The default reference is a once-a-day rate, so it measures lasting premiums, not intraday lag.
+
+### Shadow execution
+
+`SHADOW=1` (dry-run or paper only, live quotes only) takes each scan's best round trip that clears `SHADOW_MIN_NET_BPS` and walks it the way live mode would, at most `SHADOW_MAX_PER_HOUR` times an hour. It re-prices leg one, sizes leg two from leg one's guaranteed minimum, re-prices leg two, builds each on-chain leg's calldata, and records the outcome (`would_fill`, `edge_gone`, `leg_failed`), the re-priced net, each leg's drift from the scan, and timing in `shadow_trades`. It never signs or sends a transaction. `npm run report` summarises it.
+
+The Textile leg is a fresh preview unless `SHADOW_TAKER_KEY` is set. With it, Omnis signs Textile's proof-of-control message (an off-chain text that, in Textile's words, does not approve any transfer, trade or allowance), requests a firm quote, records it, and releases it straight away with `/cancel`. Textile only firm-quotes a taker that holds the sell amount, so that wallet needs a small balance of what it sells. Shadow mode never moves those funds, but the key is a hot key: use a dedicated wallet holding only what the measurement needs, never the trading key (startup refuses that), and keep the key in `.env`, never in the repository.
+
+`npm run measure` runs the desk for measurement and restarts it if it stops: paper mode, live quotes, shadow on, sizes up to $1,000, the desk page on 127.0.0.1, data and `desk.log` in `./data-measure`. Values in your environment or `.env` override those defaults. On Windows PowerShell, use `npm.cmd` if script execution is disabled.
 
 ### Paper and dry-run
 
@@ -116,6 +153,13 @@ Even then, the desk will not broadcast a Textile preview. A preview is not a fil
 | `MODE` | `dry-run` | `dry-run`, `paper`, or `live` |
 | `CELO_RPC` | `https://forno.celo.org` | Celo RPC |
 | `PORT` | `43123` | HTTP port |
+| `HOST` | `0.0.0.0` | Bind address. `127.0.0.1` for a local-only desk |
+| `FX_REFERENCE_URL` | `https://open.er-api.com/v6/latest/USD` | Fiat reference for measurement. `off` disables |
+| `FX_REFERENCE_TTL_SEC` | `3600` | How long reference rates are cached |
+| `SHADOW` | `0` | `1` walks the best route each scan as live mode would, without signing. Dry-run and paper only |
+| `SHADOW_MIN_NET_BPS` | `0` | Only shadow a route whose scanned net (after the cushion) is at least this |
+| `SHADOW_MAX_PER_HOUR` | `20` | Cap on shadow runs in any rolling hour |
+| `SHADOW_TAKER_KEY` | | Optional dedicated wallet that signs Textile proof-of-control for firm quotes. Never the trading key |
 | `DATA_DIR` | `./data` | SQLite directory |
 | `MIN_EDGE_USD` | `0.05` | Minimum net dollars |
 | `MIN_EDGE_BPS` | `3` | Minimum net basis points |
@@ -131,6 +175,8 @@ Even then, the desk will not broadcast a Textile preview. A preview is not a fil
 | `CONVERT_FEE_BPS` | `0` | Input fee, max 100 |
 | `TREASURY_ADDRESS` | | Required when the fee is non-zero |
 | `API_KEYS` | | Comma-separated Convert keys |
+| `ADMIN_KEYS` | | Comma-separated operator keys for `/admin` and status endpoints |
+| `PUBLIC_STATUS` | `0` | `1` serves status, trades, P&L, and metrics without a key (local only) |
 | `CORS_ORIGINS` | | Comma-separated origins, no wildcards |
 | `RATE_LIMIT_PER_MIN` | `60` | Per API key |
 | `ATTRIBUTION_TAG` | | Optional ERC-8021 code, `[a-z0-9_]{1,32}` |

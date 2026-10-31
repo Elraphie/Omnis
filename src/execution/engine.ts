@@ -1,6 +1,8 @@
 import type { AppConfig } from '../config/load.js'
 import { activeCorridors, TOKENS, token, venuesForPair, type VenueId } from '../config/tokens.js'
 import { gasCostUsdMicros, ladderSizes, microsToNumber } from '../pricing/math.js'
+import { referenceGaps, type ReferenceGap, type ReferenceRates } from '../reference/fx.js'
+import { shadowCandidate, shadowView, type ShadowResult, type ShadowView } from './shadow.js'
 import { killReason, reviewOpenRisk, reviewReduceRisk, shouldTripLossStop } from '../risk/guards.js'
 import { findArbs, type ArbOpportunity, type PricedQuote } from '../strategies/arbitrage.js'
 import { bestBid, buildMmQuotes, fxRebalance, inventoryMarks, nairaBasis, priceOf, type BasisRow, type MmQuote } from '../strategies/book.js'
@@ -30,6 +32,9 @@ export interface CycleReport {
   decision: StrategyChoice
   mmQuotes: MmQuote[]
   basis: BasisRow[]
+  /** On-chain prices against the fiat reference at the smallest clip. Empty without a reference. */
+  referenceGaps: ReferenceGap[]
+  referenceAsOf: string | null
   venueErrors: { venue: string; message: string }[]
   quoteCount: number
   paper: {
@@ -39,6 +44,8 @@ export interface CycleReport {
     balances: Record<string, string>
   }
   trade: { strategy: string; pair: string; pnlUsd: number } | null
+  /** What live execution would have met on this cycle's best route. Null when shadow mode is off or skipped. */
+  shadow: ShadowView | null
 }
 
 export interface CycleDeps {
@@ -49,6 +56,13 @@ export interface CycleDeps {
   celoUsdMicros: bigint
   quoteSource: 'live' | 'fixture'
   now?: Date
+  /** Fiat rates per USD to measure on-chain prices against. Measurement only; no decision reads it. */
+  reference?: ReferenceRates | null
+  /**
+   * Shadow execution for dry-run and paper on live quotes. Returns null when its hourly budget is spent.
+   * It never signs; live mode never calls it.
+   */
+  shadow?: (opp: ArbOpportunity) => Promise<ShadowResult | null>
   /** Called only when mode is live and a broadcastable route exists. */
   broadcaster?: (opp: ArbOpportunity) => Promise<void>
 }
@@ -141,6 +155,22 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     adverseBps: cfg.adverseBps,
   })
   const chosen = bestArb(opps, cfg.minEdgeUsdMicros, cfg.minEdgeBps)
+  store.insertOpportunities(ts, deps.quoteSource, opps.map((opp) => ({
+    corridor: opp.corridor,
+    buyVenue: opp.buyVenue,
+    sellVenue: opp.sellVenue,
+    sizeUsd: microsToNumber(opp.sizeUsdMicros),
+    grossUsd: microsToNumber(opp.grossUsdMicros),
+    gasUsd: microsToNumber(opp.gasUsdMicros),
+    bufferUsd: microsToNumber(opp.adverseUsdMicros),
+    netUsd: microsToNumber(opp.netUsdMicros),
+    netBps: Number(opp.netBps),
+  })))
+  const smallest = sizes.reduce<bigint | null>((min, size) => (min === null || size < min ? size : min), null)
+  const gaps = deps.reference && smallest !== null
+    ? referenceGaps({ corridors, quotes, reference: deps.reference, sizeUsdMicros: smallest })
+    : []
+  if (deps.reference) store.insertReferenceGaps(ts, deps.quoteSource, deps.reference, gaps)
   const balances = store.balances()
   const marks = inventoryMarks(balances, quotes)
   const inventoryUsd = (symbol: string) => marks.usd[symbol] ?? 0n
@@ -222,13 +252,17 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     rebalance,
     rebalanceBlock: rebalanceBlock && !rebalanceBlock.ok ? rebalanceBlock.reason : null,
   })
+  if (cfg.mode === 'live' && deps.quoteSource === 'fixture' && decision.action !== 'hold') {
+    decision = { strategy: decision.strategy, action: 'hold', reason: 'fixture quotes are not tradable' }
+  }
   if (decision.action === 'arbitrage' && chosen && (balances.USDT ?? 0n) < chosen.sizeUsdMicros && cfg.mode !== 'dry-run') {
     decision = { strategy: 'arbitrage', action: 'hold', reason: 'insufficient paper USDT' }
   }
 
   let trade: CycleReport['trade'] = null
   if (decision.action === 'arbitrage' && chosen && cfg.mode === 'paper') {
-    const pnl = chosen.grossUsdMicros - chosen.gasUsdMicros
+    // Book the same net edge the decision used, cushion included, so paper P&L is not flattered.
+    const pnl = chosen.netUsdMicros
     store.setBalance('USDT', (balances.USDT ?? 0n) + pnl)
     store.addRealized(pnl)
     store.insertTrade({
@@ -287,6 +321,16 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     }
   }
 
+  let shadow: ShadowView | null = null
+  if (deps.shadow && cfg.mode !== 'live' && deps.quoteSource === 'live') {
+    const candidate = shadowCandidate(opps, cfg.shadowMinNetBps)
+    const result = candidate ? await deps.shadow(candidate) : null
+    if (result) {
+      shadow = shadowView(result)
+      store.insertShadow(ts, shadow)
+    }
+  }
+
   const after = inventoryMarks(store.balances(), quotes)
   const equity = after.totalUsd
   const realized = store.realized()
@@ -320,6 +364,8 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
     decision,
     mmQuotes,
     basis,
+    referenceGaps: gaps,
+    referenceAsOf: deps.reference?.asOf ?? null,
     venueErrors: errors,
     quoteCount: quotes.length,
     paper: {
@@ -329,5 +375,6 @@ export async function runCycle(deps: CycleDeps): Promise<CycleReport> {
       balances: balanceView,
     },
     trade,
+    shadow,
   }
 }

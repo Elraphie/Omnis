@@ -1,7 +1,9 @@
+import { randomBytes } from 'node:crypto'
 import type { Address, Hex } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import type { ChainClient } from './chain/client.js'
 import { erc20Abi } from 'viem'
-import type { AppConfig } from './config/load.js'
+import type { AppConfig, Secrets } from './config/load.js'
 import { CONTRACTS, token } from './config/tokens.js'
 import {
   assembleQuote,
@@ -15,6 +17,9 @@ import {
 } from './convert/service.js'
 import { runCycle, type CycleDeps, type CycleReport } from './execution/engine.js'
 import { executeLive } from './execution/live.js'
+import { shadowArb, shadowBudget, type ShadowResult } from './execution/shadow.js'
+import type { ArbOpportunity } from './strategies/arbitrage.js'
+import { createReferenceFeed, type ReferenceFeed } from './reference/fx.js'
 import type { TradingSigner } from './chain/signer.js'
 import type { Store } from './store/db.js'
 import { fallbackAdapters, createLiveAdapters } from './venues/registry.js'
@@ -32,12 +37,37 @@ async function gasPrice(client: ChainClient | null, fallback: bigint): Promise<b
   }
 }
 
+/** Shadow execution bound to one cycle's live adapters and gas price. Null when its hourly budget is spent. */
+export type ShadowRunner = (opp: ArbOpportunity, ctx: { adapters: VenueAdapter[]; gasPriceWei: bigint }) => Promise<ShadowResult | null>
+
+/** Null unless SHADOW=1. With SHADOW_TAKER_KEY the Textile leg is a firm quote; without it, a fresh preview. */
+export function shadowRunnerFor(cfg: AppConfig, secrets: Secrets): ShadowRunner | null {
+  if (!cfg.shadow || cfg.mode === 'live') return null
+  const taker = secrets.shadowTakerKey ? privateKeyToAccount(secrets.shadowTakerKey) : null
+  const allow = shadowBudget(cfg.shadowMaxPerHour)
+  return async (opp, ctx) => {
+    if (!allow()) return null
+    return shadowArb(opp, {
+      adapters: ctx.adapters,
+      slippageBps: cfg.slippageBps,
+      gasPriceWei: ctx.gasPriceWei,
+      celoUsdMicros: cfg.celoUsdMicros,
+      timeoutMs: cfg.quoteTimeoutMs,
+      textileApi: cfg.textileApi,
+      takerSigner: taker,
+      randomNonce: () => `0x${randomBytes(32).toString('hex')}`,
+    }, (venue) => cfg.gasUnits[venue])
+  }
+}
+
 export async function runDeskCycle(args: {
   cfg: AppConfig
   store: Store
   client: ChainClient | null
   signer: TradingSigner
   now?: Date
+  reference?: ReferenceFeed | null
+  shadow?: ShadowRunner | null
 }): Promise<CycleReport> {
   const gas = await gasPrice(args.client, args.cfg.gasPriceWeiFallback)
   const base: Omit<CycleDeps, 'adapters' | 'quoteSource'> = {
@@ -46,6 +76,7 @@ export async function runDeskCycle(args: {
     gasPriceWei: gas,
     celoUsdMicros: args.cfg.celoUsdMicros,
     now: args.now,
+    reference: args.reference ? await args.reference.get() : null,
     broadcaster: async (opp) => {
       await executeLive({
         mode: args.cfg.mode,
@@ -60,11 +91,26 @@ export async function runDeskCycle(args: {
   if (args.cfg.quoteSource === 'fixture' || !args.client) {
     return runCycle({ ...base, adapters: fallbackAdapters(), quoteSource: 'fixture' })
   }
-  const live = await runCycle({ ...base, adapters: createLiveAdapters(args.client, args.cfg), quoteSource: 'live' })
-  if (args.cfg.quoteSource === 'auto' && live.quoteCount === 0) {
+  const adapters = createLiveAdapters(args.client, args.cfg)
+  const shadow = args.shadow
+  const live = await runCycle({
+    ...base,
+    adapters,
+    quoteSource: 'live',
+    shadow: shadow ? (opp) => shadow(opp, { adapters, gasPriceWei: gas }) : undefined,
+  })
+  // The fixture fallback is a demo aid. In paper or live mode it would book or chase made-up prices,
+  // so those modes hold on an empty book instead.
+  if (args.cfg.quoteSource === 'auto' && live.quoteCount === 0 && args.cfg.mode === 'dry-run') {
     return runCycle({ ...base, adapters: fallbackAdapters(), quoteSource: 'fixture' })
   }
   return live
+}
+
+/** Null when FX_REFERENCE_URL is empty. Refresh failures are logged through `onError` and never stop a scan. */
+export function referenceFeedFor(cfg: AppConfig, onError?: (message: string) => void): ReferenceFeed | null {
+  if (!cfg.fxReferenceUrl) return null
+  return createReferenceFeed({ url: cfg.fxReferenceUrl, ttlMs: cfg.fxReferenceTtlSec * 1000, timeoutMs: cfg.quoteTimeoutMs, onError })
 }
 
 async function quotesFor(
@@ -88,7 +134,9 @@ async function quotesFor(
 }
 
 export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | null }) {
-  const adapters = (): VenueAdapter[] => (args.cfg.quoteSource === 'fixture' || !args.client)
+  // Convert never falls back from live to fixture prices. With no live route it says so.
+  const quoteSource: ConvertQuote['quoteSource'] = (args.cfg.quoteSource === 'fixture' || !args.client) ? 'fixture' : 'live'
+  const adapters = (): VenueAdapter[] => (quoteSource === 'fixture' || !args.client)
     ? fallbackAdapters()
     : createLiveAdapters(args.client, args.cfg)
 
@@ -99,10 +147,7 @@ export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | n
     const { fee, swapAmount } = args.cfg.convertFeeBps > 0n
       ? (await import('./pricing/math.js')).splitInputFee(parsed.amount, args.cfg.convertFeeBps)
       : { fee: 0n, swapAmount: parsed.amount }
-    let quotes = await quotesFor(adapters(), parsed.token.symbol, other.symbol, swapAmount, args.cfg.quoteTimeoutMs)
-    if (quotes.length === 0 && args.cfg.quoteSource === 'auto') {
-      quotes = await quotesFor(fallbackAdapters(), parsed.token.symbol, other.symbol, swapAmount, args.cfg.quoteTimeoutMs)
-    }
+    const quotes = await quotesFor(adapters(), parsed.token.symbol, other.symbol, swapAmount, args.cfg.quoteTimeoutMs)
     return {
       fee,
       swapAmount,
@@ -115,6 +160,7 @@ export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | n
         treasury: args.cfg.treasury,
         quotes,
         slippageBps: args.cfg.convertSlippageBps,
+        quoteSource,
       }),
     }
   }
@@ -127,6 +173,7 @@ export function createConvertApi(args: { cfg: AppConfig; client: ChainClient | n
       const input = body as { from?: string; to?: string; amount?: string; wallet?: string; venue?: string }
       if (!input.from || !input.to || !input.amount) throw new Error('from, to, and amount are required')
       const wallet = requireWallet(input.wallet)
+      if (quoteSource !== 'live') throw new Error('build needs live quotes. Fixture prices are for demos and are never signed.')
       const pricedQuote = await priced(input.from, input.to, input.amount)
       const chosen = input.venue
         ? pricedQuote.quotes.find((quote) => quote.venue === input.venue)

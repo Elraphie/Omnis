@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
+import type { Queryable } from '../analysis/load.js'
 import { jsonSafe } from '../util.js'
 
 function asBigint(value: SQLOutputValue | undefined): bigint {
@@ -93,11 +94,79 @@ export class Store {
         symbol TEXT PRIMARY KEY,
         amount TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS opportunities (
+        id INTEGER PRIMARY KEY,
+        ts TEXT NOT NULL,
+        quote_source TEXT NOT NULL,
+        corridor TEXT NOT NULL,
+        buy_venue TEXT NOT NULL,
+        sell_venue TEXT NOT NULL,
+        size_usd REAL NOT NULL,
+        gross_usd REAL NOT NULL,
+        gas_usd REAL NOT NULL,
+        buffer_usd REAL NOT NULL,
+        net_usd REAL NOT NULL,
+        net_bps REAL NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS opportunities_ts ON opportunities (ts);
+      CREATE TABLE IF NOT EXISTS reference_gaps (
+        id INTEGER PRIMARY KEY,
+        ts TEXT NOT NULL,
+        quote_source TEXT NOT NULL,
+        corridor TEXT NOT NULL,
+        venue TEXT NOT NULL,
+        side TEXT NOT NULL,
+        size_usd REAL NOT NULL,
+        onchain_per_usd REAL NOT NULL,
+        ref_per_usd REAL NOT NULL,
+        gap_bps REAL NOT NULL,
+        ref_source TEXT NOT NULL,
+        ref_as_of TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS reference_gaps_ts ON reference_gaps (ts);
+      CREATE TABLE IF NOT EXISTS shadow_trades (
+        id INTEGER PRIMARY KEY,
+        ts TEXT NOT NULL,
+        corridor TEXT NOT NULL,
+        buy_venue TEXT NOT NULL,
+        sell_venue TEXT NOT NULL,
+        size_usd REAL NOT NULL,
+        scan_net_usd REAL NOT NULL,
+        scan_net_bps REAL NOT NULL,
+        outcome TEXT NOT NULL,
+        net_usd REAL,
+        net_bps REAL,
+        buy_status TEXT NOT NULL,
+        sell_status TEXT,
+        buy_drift_bps REAL,
+        sell_drift_bps REAL,
+        textile_status TEXT,
+        textile_detail TEXT,
+        all_built INTEGER NOT NULL,
+        elapsed_ms INTEGER NOT NULL,
+        payload TEXT NOT NULL
+      );
     `)
+  }
+
+  private batch(run: () => void): void {
+    this.db.exec('BEGIN')
+    try {
+      run()
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   close(): void {
     this.db.close()
+  }
+
+  /** Read access for the analysis loaders in src/analysis/load.ts. */
+  get reader(): Queryable {
+    return this.db
   }
 
   getKv(key: string): string | null {
@@ -171,6 +240,50 @@ export class Store {
   insertScan(row: { ts: string; mode: string; quoteSource: string; bestEdgeUsd: number | null; bestEdgeBps: number | null; payload: unknown }): void {
     this.db.prepare('INSERT INTO scans (ts, mode, quote_source, best_edge_usd, best_edge_bps, payload) VALUES (?, ?, ?, ?, ?, ?)').run(
       row.ts, row.mode, row.quoteSource, row.bestEdgeUsd, row.bestEdgeBps, jsonSafe(row.payload),
+    )
+  }
+
+  /** Every scanned round trip, not just the best, so edge frequency per route can be measured later. */
+  insertOpportunities(ts: string, quoteSource: string, rows: {
+    corridor: string; buyVenue: string; sellVenue: string; sizeUsd: number
+    grossUsd: number; gasUsd: number; bufferUsd: number; netUsd: number; netBps: number
+  }[]): void {
+    if (rows.length === 0) return
+    const insert = this.db.prepare('INSERT INTO opportunities (ts, quote_source, corridor, buy_venue, sell_venue, size_usd, gross_usd, gas_usd, buffer_usd, net_usd, net_bps) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    this.batch(() => {
+      for (const row of rows) {
+        insert.run(ts, quoteSource, row.corridor, row.buyVenue, row.sellVenue, row.sizeUsd, row.grossUsd, row.gasUsd, row.bufferUsd, row.netUsd, row.netBps)
+      }
+    })
+  }
+
+  insertReferenceGaps(ts: string, quoteSource: string, ref: { source: string; asOf: string }, rows: {
+    corridor: string; venue: string; side: string; sizeUsd: number; onchainPerUsd: number; refPerUsd: number; gapBps: number
+  }[]): void {
+    if (rows.length === 0) return
+    const insert = this.db.prepare('INSERT INTO reference_gaps (ts, quote_source, corridor, venue, side, size_usd, onchain_per_usd, ref_per_usd, gap_bps, ref_source, ref_as_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    this.batch(() => {
+      for (const row of rows) {
+        insert.run(ts, quoteSource, row.corridor, row.venue, row.side, row.sizeUsd, row.onchainPerUsd, row.refPerUsd, row.gapBps, ref.source, ref.asOf)
+      }
+    })
+  }
+
+  insertShadow(ts: string, row: {
+    corridor: string; buyVenue: string; sellVenue: string; sizeUsd: number; scanNetUsd: number; scanNetBps: number
+    outcome: string; netUsd: number | null; netBps: number | null; elapsedMs: number
+    legs: { venue: string; status: string; driftBps: number | null; built: boolean; detail: string }[]
+  }): void {
+    const [buy, sell] = row.legs
+    const textile = row.legs.find((leg) => leg.venue === 'textile-rfq')
+    // A Textile preview has no calldata to build; only the on-chain legs and a firm Textile leg count.
+    const allBuilt = row.legs.length === 2 && row.legs.every((leg) => leg.built || leg.status === 'preview_only')
+    this.db.prepare(`INSERT INTO shadow_trades (ts, corridor, buy_venue, sell_venue, size_usd, scan_net_usd, scan_net_bps, outcome, net_usd, net_bps,
+      buy_status, sell_status, buy_drift_bps, sell_drift_bps, textile_status, textile_detail, all_built, elapsed_ms, payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      ts, row.corridor, row.buyVenue, row.sellVenue, row.sizeUsd, row.scanNetUsd, row.scanNetBps, row.outcome, row.netUsd, row.netBps,
+      buy?.status ?? 'error', sell?.status ?? null, buy?.driftBps ?? null, sell?.driftBps ?? null,
+      textile?.status ?? null, textile?.detail || null, allBuilt ? 1 : 0, row.elapsedMs, jsonSafe(row),
     )
   }
 

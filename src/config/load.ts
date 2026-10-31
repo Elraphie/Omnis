@@ -14,6 +14,9 @@ const envSchema = z.object({
   CONFIRM_LIVE: z.string().optional(),
   CELO_RPC: z.string().url().default('https://forno.celo.org'),
   PORT: z.coerce.number().int().positive().max(65535).default(43123),
+  HOST: z.string().min(1).default('0.0.0.0'),
+  FX_REFERENCE_URL: z.union([z.literal('off'), z.string().url()]).default('https://open.er-api.com/v6/latest/USD'),
+  FX_REFERENCE_TTL_SEC: z.coerce.number().int().positive().default(3600),
   DATA_DIR: z.string().min(1).default('./data'),
   MIN_EDGE_USD: z.coerce.number().nonnegative().default(0.05),
   MIN_EDGE_BPS: z.coerce.number().nonnegative().max(10_000).default(3),
@@ -32,6 +35,8 @@ const envSchema = z.object({
   TREASURY_ADDRESS: z.string().optional(),
   CORS_ORIGINS: z.string().default(''),
   API_KEYS: z.string().default(''),
+  ADMIN_KEYS: z.string().default(''),
+  PUBLIC_STATUS: z.enum(['0', '1']).default('0'),
   RATE_LIMIT_PER_MIN: z.coerce.number().int().positive().max(10_000).default(60),
   PAPER_USDT: z.coerce.number().positive().default(1000),
   QUOTE_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(8000),
@@ -54,6 +59,10 @@ const envSchema = z.object({
   GAS_UNITS_MENTO: z.coerce.number().int().positive().default(220_000),
   GAS_UNITS_MENTO_V3: z.coerce.number().int().positive().default(220_000),
   STARTUP_DELAY_SEC: z.coerce.number().nonnegative().default(0),
+  SHADOW: z.enum(['0', '1']).default('0'),
+  SHADOW_MIN_NET_BPS: z.coerce.number().int().min(-10_000).max(10_000).default(0),
+  SHADOW_MAX_PER_HOUR: z.coerce.number().int().positive().max(600).default(20),
+  SHADOW_TAKER_KEY: z.string().optional(),
 })
 
 export interface ApiKeyRecord {
@@ -67,6 +76,10 @@ export interface AppConfig {
   chainId: 42220
   rpcUrl: string
   port: number
+  host: string
+  /** Fiat reference for measurement. Empty when FX_REFERENCE_URL=off. */
+  fxReferenceUrl: string
+  fxReferenceTtlSec: number
   dataDir: string
   minEdgeUsdMicros: bigint
   minEdgeBps: bigint
@@ -85,6 +98,10 @@ export interface AppConfig {
   treasury: Address | null
   corsOrigins: string[]
   apiKeys: ApiKeyRecord[]
+  /** Operator keys for /admin and the desk's status, P&L, and metrics. Never shared with Convert customers. */
+  adminKeys: ApiKeyRecord[]
+  /** Local development only: serve status, trades, P&L, and metrics without a key. */
+  publicStatus: boolean
   rateLimitPerMin: number
   paperUsdtMicros: bigint
   quoteTimeoutMs: number
@@ -103,10 +120,16 @@ export interface AppConfig {
   targetUsdtBps: bigint
   gasUnits: Record<VenueId, bigint>
   startupDelaySec: number
+  /** Walk the best route as live mode would, without signing. Dry-run and paper only. */
+  shadow: boolean
+  shadowMinNetBps: bigint
+  shadowMaxPerHour: number
 }
 
 export interface Secrets {
   agentPrivateKey?: Hex
+  /** Signs Textile proof-of-control messages in shadow mode. Never a transaction. */
+  shadowTakerKey?: Hex
 }
 
 export interface LoadedConfig {
@@ -158,10 +181,10 @@ function parseOrigins(raw: string): string[] {
   return raw.split(',').map((origin) => origin.trim()).filter(Boolean)
 }
 
-function parseKeys(raw: string): ApiKeyRecord[] {
+function parseKeys(raw: string, name: string): ApiKeyRecord[] {
   if (!raw.trim()) return []
   return raw.split(',').map((key) => key.trim()).filter(Boolean).map((key) => {
-    if (!API_KEY.test(key)) throw new Error('API_KEYS entries must be 12-128 chars of letters, numbers, _ or -')
+    if (!API_KEY.test(key)) throw new Error(`${name} entries must be 12-128 chars of letters, numbers, _ or -`)
     return hashApiKey(key)
   })
 }
@@ -197,7 +220,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
   }
   if (gasPriceWeiFallback < 0n) throw new Error('GAS_PRICE_WEI_FALLBACK must be non-negative')
   const ladderBps = parseLadder(raw.SIZE_LADDER)
-  const apiKeys = parseKeys(raw.API_KEYS)
+  const apiKeys = parseKeys(raw.API_KEYS, 'API_KEYS')
+  const adminKeys = parseKeys(raw.ADMIN_KEYS, 'ADMIN_KEYS')
+  if (adminKeys.some((admin) => apiKeys.some((key) => key.hash.equals(admin.hash)))) {
+    throw new Error('ADMIN_KEYS cannot reuse a key from API_KEYS. A Convert customer must not reach the kill switch.')
+  }
   const privateKey = raw.AGENT_PRIVATE_KEY?.trim()
   if (privateKey && !PRIVATE_KEY.test(privateKey)) throw new Error('AGENT_PRIVATE_KEY must be a 32-byte hex key')
 
@@ -221,6 +248,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     signerKind = 'readonly'
   }
   if (raw.MIN_TRADE_USD > raw.MAX_TRADE_USD) throw new Error('MIN_TRADE_USD cannot exceed MAX_TRADE_USD')
+  const shadowKey = raw.SHADOW_TAKER_KEY?.trim()
+  if (raw.SHADOW === '1' && raw.MODE === 'live') throw new Error('SHADOW is for dry-run and paper. Live mode does not shadow.')
+  if (shadowKey) {
+    if (!PRIVATE_KEY.test(shadowKey)) throw new Error('SHADOW_TAKER_KEY must be a 32-byte hex key')
+    if (privateKey && shadowKey.toLowerCase() === privateKey.toLowerCase()) {
+      throw new Error('SHADOW_TAKER_KEY must not be the trading key. Use a separate wallet for shadow quotes.')
+    }
+  }
 
   const gasUnits = {
     'uniswap-v3': BigInt(raw.GAS_UNITS_UNISWAP),
@@ -238,6 +273,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     chainId: 42220,
     rpcUrl: raw.CELO_RPC,
     port: raw.PORT,
+    host: raw.HOST,
+    fxReferenceUrl: raw.FX_REFERENCE_URL === 'off' ? '' : raw.FX_REFERENCE_URL,
+    fxReferenceTtlSec: raw.FX_REFERENCE_TTL_SEC,
     dataDir: raw.DATA_DIR,
     minEdgeUsdMicros: usdToMicros(raw.MIN_EDGE_USD),
     minEdgeBps: BigInt(Math.round(raw.MIN_EDGE_BPS)),
@@ -256,6 +294,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     treasury: treasuryRaw ? (treasuryRaw as Address) : null,
     corsOrigins,
     apiKeys,
+    adminKeys,
+    publicStatus: raw.PUBLIC_STATUS === '1',
     rateLimitPerMin: raw.RATE_LIMIT_PER_MIN,
     paperUsdtMicros: usdToMicros(raw.PAPER_USDT),
     quoteTimeoutMs: raw.QUOTE_TIMEOUT_MS,
@@ -274,10 +314,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LoadedConfig {
     targetUsdtBps: BigInt(raw.TARGET_USDT_BPS),
     gasUnits,
     startupDelaySec: raw.STARTUP_DELAY_SEC,
+    shadow: raw.SHADOW === '1',
+    shadowMinNetBps: BigInt(raw.SHADOW_MIN_NET_BPS),
+    shadowMaxPerHour: raw.SHADOW_MAX_PER_HOUR,
   }
+  const secrets: Secrets = cfg.mode === 'live' && privateKey ? { agentPrivateKey: privateKey as Hex } : {}
+  if (cfg.shadow && shadowKey) secrets.shadowTakerKey = shadowKey as Hex
   return {
     cfg,
-    secrets: cfg.mode === 'live' && privateKey ? { agentPrivateKey: privateKey as Hex } : {},
+    secrets,
     privateKeyPresent: Boolean(privateKey),
   }
 }
@@ -298,11 +343,16 @@ export function publicConfig(cfg: AppConfig) {
     convertFeeBps: Number(cfg.convertFeeBps),
     treasury: cfg.treasury,
     quoteSource: cfg.quoteSource,
+    fxReference: cfg.fxReferenceUrl ? new URL(cfg.fxReferenceUrl).host : null,
+    shadow: cfg.shadow,
+    shadowMaxPerHour: cfg.shadowMaxPerHour,
     signer: cfg.signerKind,
     attributionTag: cfg.attributionTag || null,
     includeExtended: cfg.includeExtended,
     corsOrigins: cfg.corsOrigins,
     apiKeyCount: cfg.apiKeys.length,
+    adminKeyCount: cfg.adminKeys.length,
+    publicStatus: cfg.publicStatus,
     rateLimitPerMin: cfg.rateLimitPerMin,
   }
 }

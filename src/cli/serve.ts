@@ -1,12 +1,16 @@
 import 'dotenv/config'
 import { join } from 'node:path'
+import { erc20Abi, formatUnits } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
+import type { WalletView } from '../api/dashboard.js'
+import { TOKENS } from '../config/tokens.js'
 import { startServer } from '../api/server.js'
 import { RateLimiter } from '../api/rate-limit.js'
 import { createReader, createSigner } from '../chain/client.js'
 import { loadConfig } from '../config/load.js'
 import type { CycleReport } from '../execution/engine.js'
 import { createLogger } from '../log/logger.js'
-import { createConvertApi, runDeskCycle } from '../runtime.js'
+import { createConvertApi, referenceFeedFor, runDeskCycle, shadowRunnerFor } from '../runtime.js'
 import { Store } from '../store/db.js'
 
 const log = createLogger('omnis')
@@ -21,6 +25,32 @@ if (loaded.cfg.mode === 'live' && !signer.canSign) {
   throw new Error('MODE=live requires a signer that can sign. Attach a KMS adapter or provide AGENT_PRIVATE_KEY with CONFIRM_LIVE=I_UNDERSTAND.')
 }
 const convert = createConvertApi({ cfg: loaded.cfg, client: loaded.cfg.quoteSource === 'fixture' ? null : client })
+const reference = referenceFeedFor(loaded.cfg, (message) => log.warn('reference rates unavailable', { message }))
+const shadow = shadowRunnerFor(loaded.cfg, loaded.secrets)
+if (shadow) {
+  log.info('shadow execution on', {
+    maxPerHour: loaded.cfg.shadowMaxPerHour,
+    textileLeg: loaded.secrets.shadowTakerKey ? 'firm quote' : 'preview only',
+    shadowWallet: loaded.secrets.shadowTakerKey ? privateKeyToAccount(loaded.secrets.shadowTakerKey).address : null,
+  })
+}
+const shadowAddress = loaded.secrets.shadowTakerKey ? privateKeyToAccount(loaded.secrets.shadowTakerKey).address : null
+let walletCache: { at: number; view: WalletView } | null = null
+/** The shadow wallet's balances for the desk page, read at most once a minute. */
+async function wallet(): Promise<WalletView | null> {
+  if (!shadowAddress) return null
+  if (walletCache && Date.now() - walletCache.at < 60_000) return walletCache.view
+  const balances: Record<string, string> = {
+    CELO: formatUnits(await client.getBalance({ address: shadowAddress }), 18),
+  }
+  for (const symbol of ['USDT', 'wARS', 'cNGN', 'wBRL'] as const) {
+    const info = TOKENS[symbol]
+    const raw = await client.readContract({ address: info.address, abi: erc20Abi, functionName: 'balanceOf', args: [shadowAddress] }) as bigint
+    balances[symbol] = formatUnits(raw, info.decimals)
+  }
+  walletCache = { at: Date.now(), view: { address: shadowAddress, balances, checkedAt: new Date().toISOString() } }
+  return walletCache.view
+}
 let report: CycleReport | null = null
 let running = false
 
@@ -33,6 +63,8 @@ async function cycle() {
       store,
       client: loaded.cfg.quoteSource === 'fixture' ? null : client,
       signer,
+      reference,
+      shadow,
     })
     log.info('scan', {
       quoteSource: report.quoteSource,
@@ -40,6 +72,10 @@ async function cycle() {
       reason: report.decision.reason,
       bestEdgeBps: report.best?.netEdgeBps ?? null,
       quotes: report.quoteCount,
+      referenceGaps: report.referenceGaps.length,
+      shadow: report.shadow
+        ? `${report.shadow.outcome} ${report.shadow.corridor} ${report.shadow.buyVenue}->${report.shadow.sellVenue} net ${report.shadow.netBps ?? 'n/a'} bps`
+        : null,
       errors: report.venueErrors.length,
     })
   } catch (error) {
@@ -56,10 +92,11 @@ const server = startServer({
   getReport: () => report,
   quoteConvert: (from, to, amount) => convert.quote(from, to, amount),
   buildConvert: (body) => convert.build(body),
+  wallet,
 })
 
-server.listen(loaded.cfg.port, '0.0.0.0', () => {
-  log.info('listening', { port: loaded.cfg.port, mode: loaded.cfg.mode, signer: signer.kind })
+server.listen(loaded.cfg.port, loaded.cfg.host, () => {
+  log.info('listening', { host: loaded.cfg.host, port: loaded.cfg.port, mode: loaded.cfg.mode, signer: signer.kind })
 })
 
 if (loaded.cfg.startupDelaySec > 0) {
